@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.pombus/pombus",
+  "title": "Pombus",
+  "description": "Email boxes for AI agents. Read, draft, send and triage mail.",
+  "version": "0.1.2",
+  "websiteUrl": "https://pombus.com",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "pombus",
+      "version": "0.1.2",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        { "type": "named", "name": "-y" }
+      ],
+      "packageArguments": [
+        { "type": "positional", "value": "mcp" }
+      ],
+      "environmentVariables": [
+        {
+          "name": "POMBUS_API_KEY",
+          "description": "Your Pombus API key. The key's scope and permissions decide which tools the agent can see.",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "name": "pombus",
+  "version": "0.1.2",
+  "description": "Pombus MCP server — email boxes for AI agents. A thin stdio translator between MCP tool calls and the Pombus REST core.",
+  "license": "MIT",
+  "author": "Runaki",
+  "homepage": "https://pombus.com",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "email",
+    "ai-agent",
+    "agent-email",
+    "inbox"
+  ],
+  "mcpName": "com.pombus/pombus",
+  "type": "module",
+  "bin": {
+    "pombus": "dist/bin.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "!dist/**/*.test.js",
+    "!dist/testutil.js"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test \"dist/**/*.test.js\"",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.9",
+    "typescript": "5.9.3"
+  }
+}
