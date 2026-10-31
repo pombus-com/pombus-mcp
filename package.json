@@ -5,6 +5,10 @@
   "license": "MIT",
   "author": "Runaki",
   "homepage": "https://pombus.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pombus-com/pombus-mcp.git"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",

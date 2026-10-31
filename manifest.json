@@ -1,0 +1,51 @@
+{
+  "manifest_version": "0.3",
+  "name": "pombus",
+  "display_name": "Pombus",
+  "version": "0.1.2",
+  "description": "Email boxes for AI agents. Permission-scoped tools over stdio.",
+  "author": {
+    "name": "Runaki",
+    "url": "https://pombus.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pombus-com/pombus-mcp.git"
+  },
+  "homepage": "https://pombus.com",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "email",
+    "ai-agent",
+    "inbox"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/bin.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/bin.js", "mcp"],
+      "env": {
+        "POMBUS_API_KEY": "${user_config.pombus_api_key}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "user_config": {
+    "pombus_api_key": {
+      "type": "string",
+      "title": "Pombus API key",
+      "description": "The key's scope and permissions decide which tools the agent can see.",
+      "required": true,
+      "sensitive": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=20"
+    }
+  }
+}

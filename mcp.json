@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pombus": {
+      "command": "npx",
+      "args": ["-y", "pombus", "mcp"],
+      "env": {
+        "POMBUS_API_KEY": "${POMBUS_API_KEY}"
+      }
+    }
+  }
+}
