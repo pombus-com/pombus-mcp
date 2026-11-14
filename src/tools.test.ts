@@ -434,6 +434,85 @@ test("send_message maps to POST inboxes/{inbox}/messages/send with the composed 
   assert.deepEqual(call.body, { to: ["y@acme.example"], subject: "hi", text: "body" });
 });
 
+// The core refuses a user key creating an inbox on the PLATFORM domain (403 platform_inbox_not_allowed):
+// an extra inbox lives only on a verified domain of the pod. The tool says so in its contract instead of
+// letting the model discover the 403.
+test("create_inbox requires `domain`: in the schema, and refused before any request without it", async () => {
+  const fake = new FakeCore()
+    .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
+    .on("POST", (u) => u.pathname.endsWith("/inboxes"), { json: { inbox_id: "inb_new", email: "x@acme.example" } });
+  const ctx = await ctxFor(fake);
+  const d = toolDescriptors(ctx.scope).find((t) => t.name === "create_inbox")!;
+  assert.ok(((d.inputSchema?.required ?? []) as string[]).includes("domain"), "domain is a required argument");
+  assert.match(d.description ?? "", /VERIFIED domain/);
+  const before = fake.requests.length;
+  await assert.rejects(
+    () => callTool(specByName("create_inbox", ctx.scope)!, { username: "ana" }, ctx),
+    (e: unknown) => (e as { code?: string }).code === "invalid_argument:domain",
+  );
+  assert.equal(fake.requests.length, before, "no request was sent without a domain");
+  await callTool(specByName("create_inbox", ctx.scope)!, { domain: "acme.example" }, ctx);
+  assert.deepEqual(fake.requests.at(-1)!.body, { domain: "acme.example" });
+});
+
+// The installer reads the core's real code behind a collapsed 403 (CoreError.coreCode) to explain itself to
+// a person. The MODEL must never see it: a tool call that hits the platform-inbox 403 still reads as the
+// opaque not_found — the anti-enumeration collapse holds through the real MCP adapter.
+test("create_inbox on a refused domain: the model sees ONLY error: not_found, never the core's code", async () => {
+  const fake = new FakeCore()
+    .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
+    .on("POST", (u) => u.pathname.endsWith("/inboxes"), {
+      status: 403,
+      json: { name: "Forbidden", code: "platform_inbox_not_allowed", message: "x" },
+    });
+  const { client, close } = await connectedServer(fake);
+  try {
+    const res = await client.callTool({ name: "create_inbox", arguments: { domain: "pombus.com" } });
+    assert.equal(res.isError, true);
+    const text = (res.content as Array<{ type: string; text: string }>)[0]!.text;
+    assert.equal(text, "error: not_found");
+    assert.ok(!text.includes("platform"), "the core's own code never reaches the model");
+  } finally {
+    await close();
+  }
+});
+
+test("a dot-segment id never reaches the core (the URL parser would resolve it to another route)", async () => {
+  const fake = new FakeCore().on("GET", (u) => u.pathname.endsWith("/auth/me"), authMeInbox("inb_x"));
+  const ctx = await ctxFor(fake);
+  const before = fake.requests.length;
+  for (const id of ["..", "."]) {
+    await assert.rejects(
+      () => callTool(specByName("get_message", ctx.scope)!, { message_id: id }, ctx),
+      (e: unknown) => (e as { code?: string }).code === "invalid_argument:message_id",
+    );
+  }
+  assert.equal(fake.requests.length, before, "refused before any request");
+  // a real id that merely CONTAINS dots or slashes is encoded, not refused
+  for (const id of ["msg..x", "a/../b"]) {
+    await callTool(specByName("get_message", ctx.scope)!, { message_id: id }, ctx).catch(() => {});
+  }
+  const paths = fake.requests.slice(before).map((c) => new URL(c.url).pathname);
+  assert.deepEqual(paths, ["/v0/inboxes/inb_x/messages/msg..x", "/v0/inboxes/inb_x/messages/a%2F..%2Fb"]);
+});
+
+test("a dot-segment inbox_id / pod_id never reaches the core, not even the scope's own validation", async () => {
+  const authMeOrg = {
+    json: { scope_type: "organization", scope_id: "org_test", organization_id: "org_test", pod_id: null, inbox_id: null, api_key_id: null, permissions: null },
+  };
+  for (const [authMe, tool, arg] of [[authMePod(), "list_messages", "inbox_id"], [authMeOrg, "list_domains", "pod_id"]] as const) {
+    const fake = new FakeCore().on("GET", (u) => u.pathname.endsWith("/auth/me"), authMe)
+      .on("GET", () => true, { json: { inboxes: [], pods: [], domains: [], messages: [] } }); // a list would answer 2xx
+    const ctx = await ctxFor(fake);
+    const before = fake.requests.length;
+    for (const id of [".", ".."]) {
+      await assert.rejects(() => callTool(specByName(tool, ctx.scope)!, { [arg]: id }, ctx),
+        (e: unknown) => (e as { code?: string }).code === "not_found", `${tool} ${arg}=${id}`);
+    }
+    assert.equal(fake.requests.length, before, `${tool}: no request at all`);
+  }
+});
+
 test("a missing required path argument throws a stable invalid_argument code", async () => {
   const fake = new FakeCore().on("GET", (u) => u.pathname.endsWith("/auth/me"), authMeInbox("inb_x"));
   const ctx = await ctxFor(fake);

@@ -7,7 +7,8 @@
 // HOME, output sink) so a test drives the whole flow against a fake core and a temp HOME without
 // ever touching real stdin/stdout/disk.
 
-import { CoreClient, type FetchLike } from "./client.js";
+import { domainToASCII } from "node:url";
+import { CoreClient, CoreError, type FetchLike } from "./client.js";
 import { ScopeBinding } from "./scope.js";
 import {
   clientTargets,
@@ -29,6 +30,9 @@ export interface InitOptions {
   apiKey?: string | undefined;
   /** Create an inbox during init (the --create-inbox flag or an interactive yes). */
   createInbox?: boolean;
+  /** The VERIFIED own domain the new inbox is created on — required with createInbox: a user key can no
+   *  longer create an inbox on the platform domain (the core answers 403 platform_inbox_not_allowed). */
+  domain?: string | undefined;
   /** Dry run: print the block, write nothing. */
   print?: boolean;
   /** Which client to target by id; when absent, every writable detected client is written. */
@@ -69,6 +73,19 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
   const out = opts.out ?? ((l: string) => process.stderr.write(l + "\n"));
   const say = (code: string, suffix = ""): void => out(humanMessage(code, locale) + suffix);
 
+  // --create-inbox needs --domain: an extra inbox only exists on a verified domain of your own. Refuse
+  // BEFORE the key prompt and any request, with the rule spelled out (the core would answer a bare 403).
+  const rawDomain = (opts.domain ?? "").trim();
+  if (opts.createInbox && !rawDomain) {
+    say("init_inbox_needs_domain");
+    throw new InitAbort("init_inbox_needs_domain");
+  }
+  const domain = normalizeDomain(rawDomain);
+  if (opts.createInbox && !looksLikeDomain(domain)) {
+    say("init_inbox_bad_domain");
+    throw new InitAbort("init_inbox_bad_domain");
+  }
+
   // --print with no key: emit the placeholder block for every known client and stop. No network, no
   // disk. This is the "I just want the snippet" path and the safe landing for uncertain detection.
   const key = (opts.apiKey ?? "").trim() || (opts.print ? "" : await requireKey(opts));
@@ -88,7 +105,20 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
   let inboxId: string | null = scope.fixedInboxId;
   let inboxEmail: string | null = null;
   if (opts.createInbox) {
-    const created = await client.post<CreatedInbox>("/inboxes", {});
+    let created: CreatedInbox;
+    try {
+      created = await client.post<CreatedInbox>("/inboxes", { domain });
+    } catch (e) {
+      // The refusals a person can act on (INBOX_REFUSALS) get their own line (the key was fine — /auth/me passed
+      // above). Anything else rethrows to the CLI's generic handler.
+      const why = e instanceof CoreError ? (e.coreCode ?? e.code) : "";
+      const human = INBOX_REFUSALS[why];
+      if (human) {
+        say(human);
+        throw new InitAbort(human);
+      }
+      throw e;
+    }
     inboxId = typeof created.inbox_id === "string" ? created.inbox_id : inboxId;
     inboxEmail = typeof created.email === "string" ? created.email : null;
     if (inboxEmail) say("init_inbox_created", inboxEmail);
@@ -214,6 +244,32 @@ function emptyPrintResult(): InitResult {
     written: [],
     printedFor: [],
   };
+}
+
+/** The core's create-inbox refusals a person can act on -> their human line. `platform_inbox_not_allowed`,
+ *  `inbox_limit` and `missing_permission` arrive as a 403 (collapsed to not_found, real code in coreCode);
+ *  `domain_not_verified` as a 422. */
+const INBOX_REFUSALS: Record<string, string> = {
+  platform_inbox_not_allowed: "init_inbox_platform_domain",
+  domain_not_verified: "init_inbox_domain_not_verified",
+  inbox_limit: "init_inbox_limit",
+  missing_permission: "init_inbox_missing_permission",
+};
+
+/** `--domain` as the core stores it: lowercase, no trailing dot, IDN in punycode (`café.com` ->
+ *  `xn--caf-dma.com`). ASCII is restricted to letters/digits/dot/hyphen BEFORE the conversion, because
+ *  `domainToASCII` parses a URL host and would silently cut `acme.com/x` down to `acme.com`. The caller
+ *  passes it already trimmed. */
+export function normalizeDomain(raw: string): string {
+  const d = raw.toLowerCase();
+  if (!/^[a-z0-9.\-\u{80}-\u{10ffff}]+$/u.test(d)) return "";
+  return domainToASCII(d).replace(/\.$/, "");
+}
+
+/** A basic domain-name shape (labels of letters/digits/hyphens, a dot, a TLD) — catches a typo or a flag
+ *  swallowed as the value BEFORE any request. The core is the authority on whether it is verified. */
+function looksLikeDomain(d: string): boolean {
+  return d.length <= 253 && /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/.test(d);
 }
 
 /** A clean, key-free abort for a missing prerequisite (the CLI turns it into exit code 1). */

@@ -59,6 +59,42 @@ const MESSAGES: Record<string, Dict> = {
     "pt-BR": "Caixa criada: ",
     "es-419": "Casilla creada: ",
   },
+  init_inbox_needs_domain: {
+    "en-US":
+      "--create-inbox needs --domain <your verified domain>: an extra inbox can only be created on a domain you own and have verified in Pombus.",
+    "pt-BR":
+      "--create-inbox precisa de --domain <seu domínio verificado>: uma caixa adicional só pode ser criada em um domínio seu, já verificado no Pombus.",
+    "es-419":
+      "--create-inbox necesita --domain <tu dominio verificado>: una casilla adicional solo se puede crear en un dominio tuyo, ya verificado en Pombus.",
+  },
+  init_inbox_bad_domain: {
+    "en-US": "--domain must be a domain name such as acme.com (no @, no spaces, no URL).",
+    "pt-BR": "--domain precisa ser um nome de domínio, como acme.com (sem @, sem espaços, sem URL).",
+    "es-419": "--domain debe ser un nombre de dominio, como acme.com (sin @, sin espacios, sin URL).",
+  },
+  init_inbox_platform_domain: {
+    "en-US":
+      "That is the Pombus domain: your @pombus.com inbox is the one from signup, and an API key cannot create more. Use --domain with a domain you own and have verified.",
+    "pt-BR":
+      "Esse é o domínio do Pombus: sua caixa @pombus.com é a do cadastro, e uma chave de API não cria outras. Use --domain com um domínio seu, já verificado.",
+    "es-419":
+      "Ese es el dominio de Pombus: tu casilla @pombus.com es la del registro, y una clave de API no crea otras. Usa --domain con un dominio tuyo, ya verificado.",
+  },
+  init_inbox_domain_not_verified: {
+    "en-US": "That domain is not verified in your Pombus space yet. Verify it under Domains, then run init again.",
+    "pt-BR": "Esse domínio ainda não está verificado no seu espaço do Pombus. Verifique em Domínios e rode o init de novo.",
+    "es-419": "Ese dominio aún no está verificado en tu espacio de Pombus. Verifícalo en Dominios y vuelve a ejecutar init.",
+  },
+  init_inbox_limit: {
+    "en-US": "Your plan's inbox limit is reached. Delete an inbox or upgrade your plan in Pombus, then run init again.",
+    "pt-BR": "Você chegou ao limite de caixas do seu plano. Apague uma caixa ou mude de plano no Pombus e rode o init de novo.",
+    "es-419": "Llegaste al límite de casillas de tu plan. Borra una casilla o cambia de plan en Pombus y vuelve a ejecutar init.",
+  },
+  init_inbox_missing_permission: {
+    "en-US": "This API key cannot create inboxes. Use a key with the inbox-create permission (Pombus › Keys), or drop --create-inbox.",
+    "pt-BR": "Esta chave de API não pode criar caixas. Use uma chave com a permissão de criar caixa (Pombus › Chaves) ou tire o --create-inbox.",
+    "es-419": "Esta clave de API no puede crear casillas. Usa una clave con el permiso de crear casilla (Pombus › Claves) o quita --create-inbox.",
+  },
   init_config_written: {
     "en-US": "MCP config written for ",
     "pt-BR": "Config MCP gravada para ",
@@ -114,6 +150,12 @@ const MESSAGES: Record<string, Dict> = {
 const INSTALLER_CODES: readonly string[] = [
   "init_prompt_key",
   "init_inbox_created",
+  "init_inbox_needs_domain",
+  "init_inbox_bad_domain",
+  "init_inbox_platform_domain",
+  "init_inbox_domain_not_verified",
+  "init_inbox_limit",
+  "init_inbox_missing_permission",
   "init_config_written",
   "init_key_power",
   "init_restart_client",

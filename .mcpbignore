@@ -1,0 +1,10 @@
+# Keep the MCPB bundle to what the client actually runs: manifest + compiled
+# server + production node_modules. Everything below is build-only or belongs
+# to other registries (npm/Cursor) and never executes from the bundle.
+src/
+dist/**/*.test.js
+dist/testutil.js
+server.json
+mcp.json
+.cursor-plugin/
+.github/

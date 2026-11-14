@@ -1,0 +1,65 @@
+# Remote MCP worker (R2) — config for `wrangler dev` and `wrangler deploy`.
+#
+# The production route mcp.pombus.com is ACTIVE below (custom_domain). Deploy with `wrangler deploy`
+# from an account that owns the pombus.com zone and a token scoped for Workers + the zone's DNS.
+#
+# R2c resolved the former store blocker: the OAuth store (pending requests / codes / tokens) now lives
+# in ONE Durable Object (OAuthStoreDO), so state survives the isolate hops the flow takes — it is no
+# longer in per-isolate memory. The consent screen keeps the founder's 2026-10-31 product decision: the
+# human pastes their own pod-key (technical audience first); that is NOT a deploy blocker.
+#
+# nodejs_compat: the SDK's shared layer pulls a few node built-ins; the flag provides them in workerd.
+
+name = "pombus-mcp"
+main = "src/http/do-entry.ts"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# workers.dev stays off = single origin: the custom_domain mcp.pombus.com is the ONLY host. A second
+# pombus-mcp.<subdomain>.workers.dev host would make the discovery issuer (derived from the request
+# origin) diverge from mcp.pombus.com — the endpoint must have ONE host (sec audit F1).
+workers_dev = false
+
+# Production route — live. custom_domain=true provisions the DNS record + edge cert for mcp.pombus.com
+# (the zone must live in the deploying account). Top-level key — it must precede the [[...]] tables below.
+route = { pattern = "mcp.pombus.com", custom_domain = true }
+
+# The OAuth store Durable Object. One instance (resolved by a fixed name in store-do.ts) is the shared,
+# isolate-stable store. It keeps state in MEMORY on purpose — the secrets it holds (the human's pod-key
+# and the minted child key) must never touch disk at rest — so the class never calls ctx.storage. The
+# migration below uses new_sqlite_classes because the free plan mandates SQLite-backed DO classes (API
+# error 10097); the SQLite store simply goes unused — our in-memory design is unchanged.
+[[durable_objects.bindings]]
+name = "OAUTH_STORE"
+class_name = "OAuthStoreDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OAuthStoreDO"]
+
+# Per-IP rate limit on the public OAuth surfaces (/authorize, /register, /token), native to Workers: 30
+# requests a minute per IP per route. A real client needs a handful; the cap is what stops a script from
+# churning the shared store. `namespace_id` is any account-unique integer (Cloudflare's requirement).
+[[ratelimits]]
+name = "RATE_LIMIT"
+namespace_id = "1101"
+simple = { limit = 30, period = 60 }
+
+# R3 consent-by-session: the human consent runs on the WEBMAIL, not here. The Worker 302s to
+# WEB_CONSENT_URL (signed), and redeems the single-use handoff over the WEB service binding — which
+# points at the webmail Worker's named entrypoint PombusWeb (mail/web/worker/index.ts, redeemMcpHandoff).
+[vars]
+# The webmail consent screen the Worker 302s a human to. A var (public URL), not a secret.
+WEB_CONSENT_URL = "https://mail.pombus.com/mcp/consent"
+
+# Service binding → the webmail Worker's PombusWeb entrypoint. `entrypoint` selects the named class, so
+# env.WEB.redeemMcpHandoff(handoff) reaches it directly (not the default fetch). The webmail deploy must
+# export PombusWeb before this binding resolves.
+[[services]]
+binding = "WEB"
+service = "pombus-web"
+entrypoint = "PombusWeb"
+
+# Secret (never in this file) — `wrangler secret put MCP_WEB_LINK_SECRET`:
+#   MCP_WEB_LINK_SECRET — random 32+ bytes; HMAC-signs the two consent 302 hops. MUST byte-match the
+#                         webmail's MCP_WEB_LINK_SECRET (mail/web) or the signatures never verify.

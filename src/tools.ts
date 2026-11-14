@@ -29,7 +29,8 @@
 
 import type { Tool, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { CoreClient, HttpMethod } from "./client.js";
-import { ScopeBinding } from "./scope.js";
+import { ScopeBinding, isDotSegment } from "./scope.js";
+import type { OAuthStoreLike } from "./http/oauth.js";
 
 /** The anti-injection notice appended to every read tool's description. Guidance TEXT to the model is
  *  protocol, so it is fixed en-US (AGENTS.md §2: the model-facing tool text may be en-US). */
@@ -39,6 +40,15 @@ const EXTERNAL_CONTENT_NOTICE =
 export interface ToolContext {
   client: CoreClient;
   scope: ScopeBinding;
+  /** Present ONLY on the OAuth/Bearer path (R3 multi-org): the token-set store + this request's opaque
+   *  access token. The two org tools (list/select_organization) read and re-point the set through it.
+   *  Absent on the x-api-key path (one org, stdio) — there the org tools are not even exposed. */
+  orgSession?: { store: OAuthStoreLike; accessToken: string };
+}
+
+/** When to expose the Bearer-only extras. `orgTools` true on the OAuth path (list/select_organization). */
+export interface CatalogOpts {
+  orgTools?: boolean;
 }
 
 /** The result a handler returns: a JSON value echoed back to the model as text. */
@@ -117,7 +127,11 @@ function coerce(type: ParamType, v: unknown): unknown {
   return str(v);
 }
 
-function enc(s: string): string {
+/** One path segment for the core URL. encodeURIComponent leaves `.` and `..` as they are, and the URL
+ *  parser then RESOLVES them: an id of `..` turns /v0/messages/{id}/raw into /v0/raw — another route.
+ *  A dot segment is never a real id, so it is refused as an invalid argument. */
+function seg(field: string, s: string): string {
+  if (isDotSegment(s)) throw new ToolArgError(field);
   return encodeURIComponent(s);
 }
 
@@ -700,7 +714,9 @@ export const TOOL_TABLE: ToolSpecDef[] = [
   {
     name: "create_inbox",
     title: "Create inbox",
-    description: "Create a new inbox in the pod.",
+    description:
+      "Create a new inbox in the pod, on one of the pod's own VERIFIED domains (`domain` is required; " +
+      "an inbox on the platform domain cannot be created with an API key).",
     method: "POST",
     path: "/pods/{pod_id}/inboxes",
     requiredPerm: "inbox_create",
@@ -709,7 +725,7 @@ export const TOOL_TABLE: ToolSpecDef[] = [
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true },
     params: [
       { name: "username", in: "body", type: "string" },
-      { name: "domain", in: "body", type: "string" },
+      { name: "domain", in: "body", type: "string", required: true },
       { name: "display_name", in: "body", type: "string" },
     ],
   },
@@ -951,11 +967,11 @@ async function dispatch(
   // Binding-owned ids first (never a free model argument that escapes scope).
   if (path.includes("{inbox_id}")) {
     const inbox = await ctx.scope.resolveInboxId(ctx.client, str(args["inbox_id"]));
-    path = path.replace("{inbox_id}", enc(inbox));
+    path = path.replace("{inbox_id}", seg("inbox_id", inbox));
   }
   if (path.includes("{pod_id}")) {
     const pod = await ctx.scope.resolvePodId(ctx.client, str(args["pod_id"]));
-    path = path.replace("{pod_id}", enc(pod));
+    path = path.replace("{pod_id}", seg("pod_id", pod));
   }
 
   // Remaining path params come from the model; the core fences the pod/inbox already bound.
@@ -967,7 +983,7 @@ async function dispatch(
     const v = coerce(p.type, args[p.name]);
     if (p.in === "path") {
       if (v === undefined) throw new ToolArgError(p.name);
-      path = path.replace(`{${p.name}}`, enc(String(v)));
+      path = path.replace(`{${p.name}}`, seg(p.name, String(v)));
     } else if (p.in === "query") {
       if (v !== undefined) query[p.name] = v as string | number;
     } else {
@@ -1045,30 +1061,153 @@ function gatedTable(scope: ScopeBinding): ToolSpecDef[] {
 }
 
 /** Build the MCP Tool descriptor list for the given scope: the gated subset, read tools carrying the
- *  anti-injection notice and readOnlyHint. */
-export function toolDescriptors(scope: ScopeBinding): Tool[] {
-  return gatedTable(scope).map((t) => ({
+ *  anti-injection notice and readOnlyHint. On the OAuth/Bearer path (opts.orgTools) the two
+ *  organization tools are appended — they are NOT in TOOL_TABLE (no REST route, no core permission) and
+ *  so never leak onto the x-api-key path. */
+export function toolDescriptors(scope: ScopeBinding, opts: CatalogOpts = {}): Tool[] {
+  const rest = gatedTable(scope).map((t) => ({
     name: t.name,
     title: t.title,
     description: t.readOnly ? t.description + EXTERNAL_CONTENT_NOTICE : t.description,
     inputSchema: buildSchema(t, scope),
     annotations: { title: t.title, readOnlyHint: t.readOnly, ...t.annotations },
   }));
+  return opts.orgTools ? [...rest, ...orgToolDescriptors()] : rest;
 }
 
-/** Resolve a tool by name, honouring the gate: a tool the key may not use is not found, exactly as it
- *  is absent from ListTools. This keeps CallTool and ListTools coherent — the gate is one function. */
+/** Resolve a REST tool by name, honouring the gate: a tool the key may not use is not found, exactly as
+ *  it is absent from ListTools. The org tools are resolved separately (they live outside TOOL_TABLE). */
 export function specByName(name: string, scope: ScopeBinding): ToolSpecDef | undefined {
   const def = TOOL_TABLE.find((t) => t.name === name);
   if (!def) return undefined;
   return isExposed(def, scope) ? def : undefined;
 }
 
-/** Run a tool's one REST request. Exposed so the server adapter and tests invoke it uniformly. */
+/** Run a REST tool's one request. Exposed so the server adapter and tests invoke it uniformly. */
 export function callTool(
   def: ToolSpecDef,
   args: Record<string, unknown>,
   ctx: ToolContext,
 ): Promise<ToolResultValue> {
   return dispatch(def, args, ctx);
+}
+
+// ---- organization tools (R3 multi-org, Bearer path ONLY) -----------------------------------------
+// The two tools that let an agent see and switch which authorized org its token-set is pointed at. They
+// are NOT REST calls and carry no core permission: they read/mutate the token-set in the store via
+// ctx.orgSession. They are exposed ONLY when orgTools is on (the OAuth/Bearer path) — on the x-api-key
+// path there is one org and no set, so they do not exist. The invariant they protect (Model D): the
+// worker never retains the human's identity, so list_organizations lists ONLY the authorized orgs
+// (token.orgs), never the human's whole org universe; select_organization for an org OUTSIDE the set
+// NEVER falls back to another child key — it returns an authorize_url to re-run consent for that org.
+
+export const ORG_TOOL_NAMES = ["list_organizations", "select_organization"] as const;
+export type OrgToolName = (typeof ORG_TOOL_NAMES)[number];
+
+/** The MCP descriptors for the two org tools. */
+export function orgToolDescriptors(): Tool[] {
+  return [
+    {
+      name: "list_organizations",
+      title: "List organizations",
+      description:
+        "List the organizations this connection is authorized to act for, and which one is active. " +
+        "Only organizations you have authorized appear here.",
+      inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+      annotations: { title: "List organizations", readOnlyHint: true, openWorldHint: false },
+    },
+    {
+      name: "select_organization",
+      title: "Select organization",
+      description:
+        "Switch the active organization. Pass an organization id or label from list_organizations. If " +
+        "it is one you have already authorized, the switch is instant. If not, this returns " +
+        "status 'authorization_required' with an authorize_url: open it (signed in to Pombus) to grant " +
+        "this connection access to that organization, then it becomes selectable.",
+      inputSchema: {
+        type: "object",
+        properties: { organization: { type: "string", description: "Organization id or label." } },
+        required: ["organization"],
+        additionalProperties: false,
+      },
+      annotations: { title: "Select organization", readOnlyHint: false, openWorldHint: false },
+    },
+  ];
+}
+
+/** Is `name` one of the org tools? */
+export function isOrgTool(name: string): name is OrgToolName {
+  return (ORG_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/** Run an org tool against the token-set. Requires ctx.orgSession (the Bearer path); without it the
+ *  tool does not exist, so this throws the same "unknown" shape a REST miss would (defense in depth —
+ *  it is never reached because the gate hides the tool on the x-api-key path). */
+export async function callOrgTool(
+  name: OrgToolName,
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResultValue> {
+  const session = ctx.orgSession;
+  if (!session) throw new ToolArgError("orgSession"); // unreachable on the x-api-key path (tool hidden)
+  const { store, accessToken } = session;
+
+  if (name === "list_organizations") {
+    const tok = await store.getToken(accessToken);
+    const orgs = tok ? Object.entries(tok.orgs) : [];
+    return {
+      organizations: orgs.map(([orgId, e]) => ({
+        orgId,
+        label: e.label,
+        active: tok ? orgId === tok.activeOrg : false,
+      })),
+    };
+  }
+
+  // select_organization
+  const requested = str(args["organization"]) ?? "";
+  if (!requested) throw new ToolArgError("organization");
+  const tok = await store.getToken(accessToken);
+  if (!tok) throw new ToolArgError("organization"); // token gone — the agent re-authorizes anyway
+
+  // Match by orgId first, then by (unique) label — a human passes whichever list_organizations showed.
+  let targetOrgId: string | undefined;
+  if (tok.orgs[requested]) {
+    targetOrgId = requested;
+  } else {
+    const byLabel = Object.entries(tok.orgs).filter(([, e]) => e.label === requested);
+    if (byLabel.length === 1) targetOrgId = byLabel[0]![0];
+  }
+
+  if (targetOrgId) {
+    await store.setActiveOrg(accessToken, targetOrgId);
+    return { status: "active", orgId: targetOrgId };
+  }
+
+  // The org is NOT in the authorized set. NEVER fall back to another org's child key (SEC4): mint a
+  // single-use link_token tied to THIS access token and hand back an authorize_url the agent re-runs
+  // the OAuth flow against (with its own client_id/redirect/PKCE) carrying the link_token, so /token
+  // attaches the newly consented org to the SAME access token. The url is relative — the MCP client
+  // already knows this server's origin from the connection it is calling.
+  const linkToken = randomToken();
+  await store.putLink(linkToken, accessToken);
+  return {
+    status: "authorization_required",
+    link_token: linkToken,
+    authorize_url: `/authorize?link_token=${encodeURIComponent(linkToken)}`,
+    message:
+      "Start the OAuth authorization flow against authorize_url (append your client_id, redirect_uri, " +
+      "response_type=code, PKCE and state as usual) while signed in to Pombus, to authorize this " +
+      "organization. The link_token ties the new organization to your current connection.",
+  };
+}
+
+/** A cryptographically-random opaque token (32 bytes → 43 base64url chars). Local to the tools layer so
+ *  the org link_token does not reach back into oauth.ts; identical generation. */
+function randomToken(): string {
+  const b = new Uint8Array(32);
+  crypto.getRandomValues(b);
+  let s = "";
+  for (const x of b) s += String.fromCharCode(x);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }

@@ -128,6 +128,17 @@ export function createdInbox(inboxId: string, email: string): ProgrammedReply {
   return { json: { inbox_id: inboxId, email } };
 }
 
+/** POST /inboxes as the REAL core answers a user (pod) key: an inbox is created only on a domain the
+ *  request names; with no `domain` it would land on the platform domain -> 403 platform_inbox_not_allowed. */
+export function createInboxLikeCore(inboxId: string, localpart: string): Route["reply"] {
+  return (req) => {
+    const domain = (req.body as { domain?: unknown } | undefined)?.domain;
+    return typeof domain === "string" && domain
+      ? createdInbox(inboxId, `${localpart}@${domain}`)
+      : { status: 403, json: { name: "Forbidden", code: "platform_inbox_not_allowed", message: "x" } };
+  };
+}
+
 /** An /auth/me reply for a SCOPED pod key — a real permissions object drives the catalog gate. Pass
  *  the permissions the human granted the key; everything else uses invented ids (§9). */
 export function authMeScoped(

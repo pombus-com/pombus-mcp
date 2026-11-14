@@ -21,6 +21,7 @@ import { humanCodeForBoot, humanMessage, resolveLocale, type Locale } from "./i1
 export interface ParsedArgs {
   cmd: string | undefined;
   createInbox: boolean;
+  domain: string | undefined;
   print: boolean;
   help: boolean;
   locale: Locale | undefined;
@@ -36,6 +37,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   const out: ParsedArgs = {
     cmd: undefined,
     createInbox: false,
+    domain: undefined,
     print: false,
     help: false,
     locale: undefined,
@@ -56,6 +58,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     } else if (a === "--client" || a.startsWith("--client=")) {
       const v = a.includes("=") ? a.slice(a.indexOf("=") + 1) : argv[++i];
       if (v) out.client = v;
+    } else if (a === "--domain" || a.startsWith("--domain=")) {
+      // `--domain --print` must not swallow the next flag as the value: a value starting with "-" is
+      // left for the loop (domain stays unset -> init explains --domain is needed).
+      const next = argv[i + 1];
+      const v = a.includes("=") ? a.slice(a.indexOf("=") + 1) : next && !next.startsWith("-") ? argv[++i] : "";
+      if (v) out.domain = v;
     }
   }
   return out;
@@ -70,7 +78,8 @@ const USAGE = [
   "  doctor    check your API key and report its scope",
   "",
   "init options:",
-  "  --create-inbox     create a new inbox and bind the config to it",
+  "  --create-inbox     create a new inbox and bind the config to it (needs --domain)",
+  "  --domain <name>    your verified domain the new inbox is created on",
   "  --print            print the config block instead of writing it",
   "  --client <id>      target one client (claude-code|cursor|gemini|codex)",
   "  --locale <loc>     en-US | pt-BR | es-419",
@@ -94,6 +103,7 @@ async function main(): Promise<void> {
     await runInit({
       apiKey: readApiKey() ?? undefined,
       createInbox: args.createInbox,
+      ...(args.domain !== undefined ? { domain: args.domain } : {}),
       print: args.print,
       ...(args.client !== undefined ? { client: args.client } : {}),
       ...(args.locale !== undefined ? { locale: args.locale } : {}),

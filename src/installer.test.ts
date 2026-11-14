@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runInit } from "./init.js";
+import { runInit, InitAbort } from "./init.js";
 import { runDoctor } from "./doctor.js";
 import {
   clientTargets,
@@ -13,7 +13,7 @@ import {
   printableCodexToml,
   ConfigWriteError,
 } from "./clients.js";
-import { FakeCore, authMeInbox, authMePod, createdInbox } from "./testutil.js";
+import { FakeCore, authMeInbox, authMePod, createInboxLikeCore } from "./testutil.js";
 
 // Obviously-fake tokens — never a real secret (AGENTS.md §9).
 const BROAD_KEY = "pk_test_broad_pod_scope_FAKE";
@@ -175,14 +175,16 @@ test("printable blocks: JSON has the standard mcpServers wrapper; Codex TOML is 
 test("init persists EXACTLY the provided key — never mints a new one (no POST /api-keys)", async () => {
   const { home, cleanup } = tempHome();
   try {
-    // --create-inbox on a pod key: an inbox is created, but the key written is still the given one.
+    // --create-inbox --domain on a pod key: an inbox is created ON THAT DOMAIN, but the key written is
+    // still the given one. The fake answers like the real core (403 with no domain).
     const fake = new FakeCore()
       .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
-      .on("POST", (u) => u.pathname.endsWith("/inboxes"), createdInbox("inb_new", "agent@pombus.com"));
+      .on("POST", (u) => u.pathname.endsWith("/inboxes"), createInboxLikeCore("inb_new", "agent"));
     const { out } = sink();
     const res = await runInit({
       apiKey: BROAD_KEY,
       createInbox: true,
+      domain: "acme.example",
       client: "cursor",
       home,
       baseUrl: BASE,
@@ -192,6 +194,9 @@ test("init persists EXACTLY the provided key — never mints a new one (no POST 
     });
     assert.deepEqual(res.written, ["cursor"]);
     assert.equal(res.inboxId, "inb_new"); // --create-inbox still works, independent of the key
+    assert.equal(res.inboxEmail, "agent@acme.example"); // on the domain the user named, never the platform's
+    const create = fake.requests.find((r) => r.method === "POST" && r.url.endsWith("/inboxes"));
+    assert.deepEqual(create?.body, { domain: "acme.example" });
 
     const cfg = JSON.parse(readFileSync(join(home, ".cursor", "mcp.json"), "utf8")) as any;
     assert.equal(cfg.mcpServers.pombus.env.POMBUS_API_KEY, BROAD_KEY, "the provided key is persisted as-is");
@@ -202,6 +207,127 @@ test("init persists EXACTLY the provided key — never mints a new one (no POST 
     cleanup();
   }
 });
+
+// An extra inbox only exists on a verified domain of your own: the core refuses a user key creating one
+// on the platform domain (403 platform_inbox_not_allowed). init must say so BEFORE touching anything.
+test("init --create-inbox without --domain aborts with the rule: no request, no prompt, no config", async () => {
+  const { home, cleanup } = tempHome();
+  try {
+    const fake = new FakeCore()
+      .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
+      .on("POST", (u) => u.pathname.endsWith("/inboxes"), createInboxLikeCore("inb_new", "agent"));
+    for (const domain of [undefined, "", "   "]) {
+      const { out, lines } = sink();
+      let prompted = false;
+      await assert.rejects(
+        runInit({
+          createInbox: true,
+          domain,
+          client: "cursor",
+          home,
+          baseUrl: BASE,
+          fetchImpl: fake.fetch,
+          locale: "en-US",
+          out,
+          promptKey: async () => {
+            prompted = true;
+            return BROAD_KEY;
+          },
+        }),
+        (e: unknown) => e instanceof InitAbort && e.code === "init_inbox_needs_domain",
+      );
+      assert.ok(lines.some((l) => l.includes("--domain")), "the human line names the missing flag");
+      assert.equal(prompted, false, "the key is not even asked for");
+    }
+    assert.equal(fake.requests.length, 0, "nothing reached the core");
+    assert.ok(!existsSync(join(home, ".cursor", "mcp.json")), "no config was written");
+  } finally {
+    cleanup();
+  }
+});
+
+test("init --create-inbox with a malformed --domain aborts before any request", async () => {
+  const { home, cleanup } = tempHome();
+  try {
+    const fake = new FakeCore()
+      .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
+      .on("POST", (u) => u.pathname.endsWith("/inboxes"), createInboxLikeCore("inb_new", "agent"));
+    for (const domain of ["acme", "a b.com", "ana@acme.com", "https://acme.com", "--print", "acme.com/x",
+                          "café.com/x", "ana@café.com", "acme.com:443", "1.2.3.4"]) {
+      const { out, lines } = sink();
+      await assert.rejects(
+        runInit({ apiKey: BROAD_KEY, createInbox: true, domain, client: "cursor", home, baseUrl: BASE,
+                  fetchImpl: fake.fetch, locale: "en-US", out }),
+        (e: unknown) => e instanceof InitAbort && e.code === "init_inbox_bad_domain",
+        `"${domain}" must be refused`,
+      );
+      assert.ok(lines.some((l) => l.includes("acme.com")), "the line shows what a domain looks like");
+    }
+    assert.equal(fake.requests.length, 0, "nothing reached the core");
+    assert.ok(!existsSync(join(home, ".cursor", "mcp.json")), "no config was written");
+  } finally {
+    cleanup();
+  }
+});
+
+// The core's create-inbox refusals a person can act on get their own line — never the generic
+// "could not authenticate, check POMBUS_API_KEY" (the key is fine: /auth/me just passed).
+for (const [status, code, human, needle] of [
+  [403, "platform_inbox_not_allowed", "init_inbox_platform_domain", "@pombus.com"],
+  [422, "domain_not_verified", "init_inbox_domain_not_verified", "not verified"],
+  [403, "inbox_limit", "init_inbox_limit", "inbox limit"],
+  [403, "missing_permission", "init_inbox_missing_permission", "cannot create inboxes"],
+] as const) {
+  test(`init --create-inbox: a ${status} ${code} explains itself and writes no config`, async () => {
+    const { home, cleanup } = tempHome();
+    try {
+      const fake = new FakeCore()
+        .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
+        .on("POST", (u) => u.pathname.endsWith("/inboxes"), {
+          status, json: { name: "x", code, message: "x" },
+        });
+      const { out, lines } = sink();
+      await assert.rejects(
+        runInit({ apiKey: BROAD_KEY, createInbox: true, domain: "pombus.com", client: "cursor", home,
+                  baseUrl: BASE, fetchImpl: fake.fetch, locale: "en-US", out }),
+        (e: unknown) => e instanceof InitAbort && e.code === human,
+      );
+      assert.ok(lines.some((l) => l.includes(needle)), lines.join("\n"));
+      assert.ok(!lines.some((l) => l.includes("POMBUS_API_KEY")), "never blames the key");
+      assert.ok(!existsSync(join(home, ".cursor", "mcp.json")), "no config was written");
+    } finally {
+      cleanup();
+    }
+  });
+}
+
+// The core stores a domain lowercase, dot-less and in punycode: init sends exactly that, whatever the
+// person typed (case, trailing dot, Unicode IDN) — otherwise a verified domain reads as "not verified".
+for (const [typed, sent] of [
+  ["ACME.COM", "acme.com"],
+  ["acme.com.", "acme.com"],
+  ["  Acme.Com.  ", "acme.com"],
+  ["café.com", "xn--caf-dma.com"],
+  ["CAFÉ.COM.", "xn--caf-dma.com"],
+  ["пример.рф", "xn--e1afmkfd.xn--p1ai"],
+  ["xn--caf-dma.com", "xn--caf-dma.com"],
+] as const) {
+  test(`init --create-inbox --domain ${JSON.stringify(typed)} sends ${sent}`, async () => {
+    const { home, cleanup } = tempHome();
+    try {
+      const fake = new FakeCore()
+        .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
+        .on("POST", (u) => u.pathname.endsWith("/inboxes"), createInboxLikeCore("inb_new", "agent"));
+      const { out } = sink();
+      await runInit({ apiKey: BROAD_KEY, createInbox: true, domain: typed, client: "cursor", home, baseUrl: BASE,
+                      fetchImpl: fake.fetch, locale: "en-US", out });
+      const post = fake.requests.find((r) => r.method === "POST" && r.url.includes("/inboxes"));
+      assert.deepEqual(post?.body, { domain: sent });
+    } finally {
+      cleanup();
+    }
+  });
+}
 
 // 0.1.0 critical: the CLI calls runInit WITHOUT `home`, and the key landed in plain text in the cwd
 // (the user's repo) instead of HOME. Drive the exact CLI shape: no `home`, HOME env and cwd apart.
@@ -423,11 +549,12 @@ test("no human line printed by init or doctor ever contains the BROAD key", asyn
   try {
     const fake = new FakeCore()
       .on("GET", (u) => u.pathname.endsWith("/auth/me"), authMePod())
-      .on("POST", (u) => u.pathname.endsWith("/inboxes"), createdInbox("inb_new", "agent@pombus.com"));
+      .on("POST", (u) => u.pathname.endsWith("/inboxes"), createInboxLikeCore("inb_new", "agent"));
     const initSink = sink();
     await runInit({
       apiKey: BROAD_KEY,
       createInbox: true,
+      domain: "acme.example",
       client: "cursor",
       home,
       baseUrl: BASE,

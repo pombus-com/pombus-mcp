@@ -16,10 +16,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { CoreClient, CoreError, readApiKey } from "./client.js";
 import { ScopeBinding, ScopeError } from "./scope.js";
-import { specByName, toolDescriptors, callTool, ToolArgError } from "./tools.js";
+import {
+  specByName,
+  toolDescriptors,
+  callTool,
+  callOrgTool,
+  isOrgTool,
+  ToolArgError,
+  type ToolContext,
+} from "./tools.js";
+import type { OAuthStoreLike } from "./http/oauth.js";
 
 const SERVER_NAME = "pombus";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.1.7";
 
 /** Build and connect the MCP server over stdio. Fails fast (before connecting) when the key is absent,
  *  so a misconfigured client sees a clear stderr line instead of a server that answers every tool with
@@ -51,28 +60,48 @@ export async function runMcpServer(): Promise<void> {
   await server.connect(transport);
 }
 
+/** Options for buildServer. On the OAuth/Bearer path the caller passes `orgSession` (the token-set
+ *  store + the request's access token); its presence both EXPOSES the org tools and gives them the
+ *  handle they operate on. Absent (x-api-key / stdio) → one org, no org tools. */
+export interface BuildServerOpts {
+  orgSession?: { store: OAuthStoreLike; accessToken: string };
+}
+
 /** Build the Server bound to a given core client. Exposed so tests drive it with a fake core and
  *  without a real stdio transport. Resolves the key's scope up front (one /v0/auth/me call) so the
  *  tool schemas can omit inbox_id for a single-inbox key. */
-export async function buildServer(client: CoreClient): Promise<Server> {
+export async function buildServer(client: CoreClient, opts: BuildServerOpts = {}): Promise<Server> {
   const scope = await ScopeBinding.resolve(client);
+  const orgTools = opts.orgSession !== undefined;
+  const ctx: ToolContext = {
+    client,
+    scope,
+    ...(opts.orgSession !== undefined ? { orgSession: opts.orgSession } : {}),
+  };
   const server = new Server(
     { name: SERVER_NAME, version: SERVER_VERSION },
     { capabilities: { tools: {} } },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: toolDescriptors(scope),
+    tools: toolDescriptors(scope, { orgTools }),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req): Promise<CallToolResult> => {
-    // specByName honours the gate: a tool the key may not use is "unknown" here, exactly as it is
-    // absent from ListTools — the model can neither see nor call a tool outside its permissions.
-    const spec = specByName(req.params.name, scope);
-    if (!spec) return toolError(`unknown tool: ${req.params.name}`);
+    const name = req.params.name;
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
     try {
-      const value = await callTool(spec, args, { client, scope });
+      // The org tools (Bearer path only) are resolved outside the REST gate: they carry no core
+      // permission. On the x-api-key path orgTools is false, so a call to one is "unknown" below.
+      if (orgTools && isOrgTool(name)) {
+        const value = await callOrgTool(name, args, ctx);
+        return { content: [{ type: "text", text: toText(value) }] };
+      }
+      // specByName honours the gate: a tool the key may not use is "unknown" here, exactly as it is
+      // absent from ListTools — the model can neither see nor call a tool outside its permissions.
+      const spec = specByName(name, scope);
+      if (!spec) return toolError(`unknown tool: ${name}`);
+      const value = await callTool(spec, args, ctx);
       return { content: [{ type: "text", text: toText(value) }] };
     } catch (e) {
       return toolError(modelError(e));

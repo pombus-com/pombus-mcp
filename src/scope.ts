@@ -12,7 +12,15 @@
 // The core already fences every route by scope (authz_inbox), so this layer is defense in depth plus
 // an honest tool schema: the key's authority — not the model's argument — decides which inbox is read.
 
-import type { CoreClient } from "./client.js";
+import { CoreError, type CoreClient } from "./client.js";
+
+/** `.` and `..` survive encodeURIComponent and the URL parser resolves them (`/inboxes/.` is the LIST
+ *  route, which answers 2xx): never a real id, so refused exactly like an out-of-scope one. */
+export const isDotSegment = (s: string): boolean => s === "." || s === "..";
+
+function refuseDotSegment(id: string): void {
+  if (isDotSegment(id)) throw new CoreError("not_found", "not found");
+}
 
 export type ScopeType = "inbox" | "domain" | "pod" | "organization";
 
@@ -106,6 +114,7 @@ export class ScopeBinding {
     if (this.fixedInboxId !== null) return this.fixedInboxId;
     const id = (requested ?? "").trim();
     if (!id) throw new ScopeError("inbox_required");
+    refuseDotSegment(id);
     if (this.seen.has(id)) return id;
     // Not seen yet. Confirm it against the core: get_inbox 404s (via not_found) for any inbox the key
     // may not reach, so a hostile id never turns into a cross-tenant read. On success, remember it.
@@ -123,6 +132,7 @@ export class ScopeBinding {
     if (this.podId !== null) return this.podId;
     const id = (requested ?? "").trim();
     if (!id) throw new ScopeError("pod_required");
+    refuseDotSegment(id);
     await client.get(`/pods/${encodeURIComponent(id)}`); // throws CoreError('not_found') if out of scope
     return id;
   }

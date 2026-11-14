@@ -28,8 +28,13 @@ uses TOML, so `init` prints the block for you to paste).
 ```sh
 npx pombus init --print                 # print the config block, write nothing
 npx pombus init --client cursor         # target one client
-npx pombus init --create-inbox          # create an inbox during setup
+npx pombus init --create-inbox --domain acme.com   # create an inbox on YOUR verified domain
 ```
+
+`--create-inbox` needs `--domain`: an extra inbox can only be created on a domain
+you own and have verified in Pombus. (Your account's `@pombus.com` inbox is the one
+from signup; an API key cannot create more of those —
+`403 platform_inbox_not_allowed`.)
 
 ## Commands
 

@@ -20,10 +20,16 @@ export type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
  *  would distinguish "forbidden" from "not found". */
 export class CoreError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
+  /** The core's OWN stable code behind a collapsed 401/403/404 (e.g. `platform_inbox_not_allowed`).
+   *  For the HUMAN installer only (`pombus init`), which runs with the user's own key and must say WHY;
+   *  never surfaced to the model — server.ts modelError() prints `code` alone, so the anti-enumeration
+   *  collapse above stands for every tool call. */
+  readonly coreCode: string | undefined;
+  constructor(code: string, message: string, coreCode?: string) {
     super(message);
     this.name = "CoreError";
     this.code = code;
+    this.coreCode = coreCode;
   }
 }
 
@@ -58,8 +64,11 @@ export class CoreClient {
   constructor(opts: ClientOptions) {
     this.apiKey = opts.apiKey;
     this.baseUrl = resolveBaseUrl(opts.baseUrl);
-    // Node >=20 ships a global fetch; the option exists only so tests can inject a fake core.
-    this.fetchImpl = opts.fetchImpl ?? (globalThis.fetch as FetchLike);
+    // The option exists only so tests can inject a fake core. The default must be BOUND to globalThis:
+    // the workerd (Cloudflare Workers) native fetch requires `this === globalThis`, so a detached
+    // reference throws `TypeError: Illegal invocation` in production. Node's undici tolerates a
+    // detached fetch, which is why the omission passed every node:test — see client.test.ts.
+    this.fetchImpl = opts.fetchImpl ?? (globalThis.fetch.bind(globalThis) as FetchLike);
   }
 
   /** Build an absolute URL from a path and query params. Values are URL-encoded. The API key is
@@ -119,7 +128,7 @@ export class CoreClient {
 
     // Anti-enumeration: do NOT distinguish "forbidden" from "not found" to the model.
     if (res.status === 401 || res.status === 403 || res.status === 404) {
-      throw new CoreError("not_found", "resource not found");
+      throw new CoreError("not_found", "resource not found", await safeCode(res));
     }
     // Other errors: a stable code from the core body when present, else the status. The message is
     // generic; the body is read but only its `code`/`detail` string is used, never echoed verbatim

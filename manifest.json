@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "pombus",
   "display_name": "Pombus",
-  "version": "0.1.2",
+  "version": "0.1.7",
   "description": "Email boxes for AI agents. Permission-scoped tools over stdio.",
   "author": {
     "name": "Runaki",

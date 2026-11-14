@@ -27,6 +27,20 @@ test("parseArgs: --client selects one target", () => {
   assert.equal(parseArgs(["init", "--client=codex"]).client, "codex");
 });
 
+test("parseArgs: --domain names the verified domain for --create-inbox", () => {
+  assert.equal(parseArgs(["init", "--create-inbox", "--domain", "acme.example"]).domain, "acme.example");
+  assert.equal(parseArgs(["init", "--domain=acme.example"]).domain, "acme.example");
+  assert.equal(parseArgs(["init", "--create-inbox"]).domain, undefined);
+});
+
+test("parseArgs: --domain never swallows the next flag as its value", () => {
+  const a = parseArgs(["init", "--create-inbox", "--domain", "--print"]);
+  assert.equal(a.domain, undefined, "the flag is not the domain");
+  assert.equal(a.print, true, "...and the flag still takes effect");
+  assert.equal(parseArgs(["init", "--domain", "-h"]).help, true);
+  assert.equal(parseArgs(["init", "--domain"]).domain, undefined); // last arg: no value at all
+});
+
 test("parseArgs: --help, and no command", () => {
   assert.equal(parseArgs(["--help"]).help, true);
   assert.equal(parseArgs(["doctor", "-h"]).help, true);
