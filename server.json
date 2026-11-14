@@ -3,13 +3,13 @@
   "name": "com.pombus/pombus",
   "title": "Pombus",
   "description": "Email boxes for AI agents. Read, draft, send and triage mail.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "websiteUrl": "https://pombus.com",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "pombus",
-      "version": "0.1.7",
+      "version": "0.1.8",
       "runtimeHint": "npx",
       "runtimeArguments": [
         { "type": "named", "name": "-y" }

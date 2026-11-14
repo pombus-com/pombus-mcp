@@ -28,18 +28,19 @@ import {
 import type { OAuthStoreLike } from "./http/oauth.js";
 
 const SERVER_NAME = "pombus";
-const SERVER_VERSION = "0.1.7";
+const SERVER_VERSION = "0.1.8";
 
-/** Build and connect the MCP server over stdio. Fails fast (before connecting) when the key is absent,
- *  so a misconfigured client sees a clear stderr line instead of a server that answers every tool with
- *  an auth error. */
+/** Build and connect the MCP server over stdio. Without a key the server still comes up for
+ *  introspection (registries such as Glama boot it with no credential to read the catalog): it lists
+ *  every tool and answers every call with the localized "set POMBUS_API_KEY" error, making no network
+ *  call. A key that IS set but rejected still fails fast at boot — that is a config error to surface. */
 export async function runMcpServer(): Promise<void> {
   const { humanMessage, humanCodeForBoot } = await import("./i18n.js");
   const apiKey = readApiKey();
   if (!apiKey) {
     // Human-facing, localized, to stderr — never stdout (would corrupt the MCP stream).
     process.stderr.write(humanMessage("no_api_key") + "\n");
-    process.exitCode = 1;
+    await (await buildServer(null)).connect(new StdioServerTransport());
     return;
   }
   const client = new CoreClient({ apiKey });
@@ -69,19 +70,39 @@ export interface BuildServerOpts {
 
 /** Build the Server bound to a given core client. Exposed so tests drive it with a fake core and
  *  without a real stdio transport. Resolves the key's scope up front (one /v0/auth/me call) so the
- *  tool schemas can omit inbox_id for a single-inbox key. */
-export async function buildServer(client: CoreClient, opts: BuildServerOpts = {}): Promise<Server> {
-  const scope = await ScopeBinding.resolve(client);
+ *  tool schemas can omit inbox_id for a single-inbox key. `null` = no key (stdio introspection only):
+ *  the full catalog is listed and every call is refused before any request could exist. */
+export async function buildServer(client: CoreClient | null, opts: BuildServerOpts = {}): Promise<Server> {
+  if (client === null) return keylessServer();
+  return boundServer(client, await ScopeBinding.resolve(client), opts);
+}
+
+/** No key: list the whole catalog (an org master binding — every tool, generic schemas) and refuse
+ *  every call with the localized no_api_key line, so the model can tell the human what to configure.
+ *  Localized on purpose (unlike the en-US `error: <code>` protocol text): the fix is the human's. */
+function keylessServer(): Server {
+  const scope = ScopeBinding.unbound();
+  const server = newServer();
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: toolDescriptors(scope) }));
+  server.setRequestHandler(CallToolRequestSchema, async (): Promise<CallToolResult> => {
+    const { humanMessage } = await import("./i18n.js");
+    return toolError(humanMessage("no_api_key"));
+  });
+  return server;
+}
+
+function newServer(): Server {
+  return new Server({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
+}
+
+function boundServer(client: CoreClient, scope: ScopeBinding, opts: BuildServerOpts): Server {
   const orgTools = opts.orgSession !== undefined;
   const ctx: ToolContext = {
     client,
     scope,
     ...(opts.orgSession !== undefined ? { orgSession: opts.orgSession } : {}),
   };
-  const server = new Server(
-    { name: SERVER_NAME, version: SERVER_VERSION },
-    { capabilities: { tools: {} } },
-  );
+  const server = newServer();
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: toolDescriptors(scope, { orgTools }),

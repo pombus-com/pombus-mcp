@@ -50,6 +50,10 @@ Set `POMBUS_API_KEY` in the environment. `init` writes it into the MCP server
 block for you; the key never lands in your terminal scrollback. Get a key at
 [pombus.com](https://pombus.com).
 
+Without a key, `pombus mcp` still starts, for introspection only: it lists the
+tool catalog, and every tool call returns a "POMBUS_API_KEY is not set" error.
+It makes no network request until a key is set.
+
 ```json
 {
   "mcpServers": {

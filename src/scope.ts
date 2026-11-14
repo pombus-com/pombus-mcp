@@ -100,6 +100,13 @@ export class ScopeBinding {
     return new ScopeBinding(me.scope_type, null, permissions, podId);
   }
 
+  /** The binding of a server started WITHOUT a key (stdio introspection): shaped like an org master key
+   *  so the catalog lists every tool with its generic schema. It never reaches a request — the keyless
+   *  server refuses every call before dispatch (server.ts keylessServer). */
+  static unbound(): ScopeBinding {
+    return new ScopeBinding("organization", null, null, null);
+  }
+
   /** Record inbox ids returned by list_inboxes so later calls can validate against the enumeration. */
   remember(ids: Iterable<string>): void {
     for (const id of ids) this.seen.add(id);

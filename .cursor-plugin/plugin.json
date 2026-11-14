@@ -2,7 +2,7 @@
   "name": "pombus",
   "displayName": "Pombus",
   "description": "Email inboxes for AI agents. Permission-scoped tools over stdio.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "author": {
     "name": "Runaki"
   },

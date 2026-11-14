@@ -20,7 +20,9 @@ type Dict = Record<Locale, string>;
 // Codes that only ever reach the MODEL (inside a tool call) are NOT human i18n — they stay en-US
 // protocol text in server.ts (`error: <code>`), never in this dict.
 // Boot-reachable codes (path 1):
-//   - no_api_key: the key env var is unset (server.ts, before any request).
+//   - no_api_key: the key env var is unset (server.ts, before any request). Also the text of every
+//     tool call on a keyless server — the one human message that reaches the model, because only the
+//     human can fix it.
 //   - auth_failed: /v0/auth/me rejected the key at boot (invalid/expired).
 //   - network:    the core was unreachable at boot.
 //   - unknown:    the last-resort fallback for a boot error with no mapped code (bin.ts catch).
