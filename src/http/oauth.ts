@@ -370,16 +370,18 @@ function unavailable(): Response {
 /** Both POST bodies are a handful of short form fields. 8 KiB stops an arbitrary buffered body. */
 export const MAX_FORM_BYTES = 8 * 1024;
 
-async function readFormCapped(req: Request): Promise<FormData | null> {
+/** The token request body, application/x-www-form-urlencoded ONLY (RFC 6749 §4.1.3) — the caller refuses
+ *  any other content-type first. null = too large or unreadable. */
+async function readFormCapped(req: Request): Promise<URLSearchParams | null> {
   const chunks = await readBodyCapped(req);
   if (!chunks) return null;
-  const headers = { "content-type": req.headers.get("content-type") ?? "" };
-  try {
-    return await new Response(new Blob(chunks), { headers }).formData();
-  } catch {
-    return null;
-  }
+  return new URLSearchParams(await new Response(new Blob(chunks)).text());   // a lenient parser: never throws
 }
+
+/** RFC 6749 §4.1.3: the client sends the token request as application/x-www-form-urlencoded. multipart
+ *  (or anything else) is refused before a byte is read: one body format, one parser. */
+const isUrlEncoded = (req: Request): boolean =>
+  /^application\/x-www-form-urlencoded\s*(;|$)/i.test(req.headers.get("content-type") ?? "");
 
 /** Read at most MAX_FORM_BYTES, enforced on the bytes actually read (not a content-length the caller
  *  may omit or lie about). null = too large or unreadable. */
@@ -587,6 +589,7 @@ export async function handleAuthorizeReturn(req: Request, deps: OAuthDeps): Prom
  *  only if the redeem's ownerHash matches the token's owner (anti-injection). The child key and handoff
  *  are never placed in the response or a log. */
 export async function handleToken(req: Request, deps: OAuthDeps): Promise<Response> {
+  if (!isUrlEncoded(req)) return tokenError("invalid_request");
   const form = await readFormCapped(req);
   if (!form) return tooLarge();
   const grantType = String(form.get("grant_type") ?? "");

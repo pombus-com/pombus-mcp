@@ -108,9 +108,9 @@ function authorizeReturn(e: WorkerEnv, params: Record<string, string>): Promise<
 }
 
 function tokenPost(e: WorkerEnv, fields: Record<string, string>): Promise<Response> {
-  const fd = new FormData();
-  for (const [k, v] of Object.entries(fields)) fd.set(k, v);
-  return worker.fetch(new Request(`${ORIGIN}/token`, { method: "POST", body: fd }), e);
+  // application/x-www-form-urlencoded, as RFC 6749 §4.1.3 clients send it. (A FormData body is multipart, and
+  // on Node 24 undici rejects unhandled when the 413 path cancels that generated stream.)
+  return worker.fetch(new Request(`${ORIGIN}/token`, { method: "POST", body: new URLSearchParams(fields) }), e);
 }
 
 function baseParams(): Record<string, string> {
@@ -484,6 +484,38 @@ test("hardening: POST bodies above MAX_FORM_BYTES are 413", async () => {
   const e = env(new OAuthStore(), fakeWeb({}));
   const big = "x".repeat(MAX_FORM_BYTES + 1);
   assert.equal((await tokenPost(e, { grant_type: "authorization_code", code: big })).status, 413);
+  // the content-length shortcut: a declared size above the cap is refused before a byte is read
+  const declared = new Request(`${ORIGIN}/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", "content-length": String(MAX_FORM_BYTES + 1) },
+    body: "grant_type=authorization_code",
+  });
+  assert.equal((await worker.fetch(declared, e)).status, 413);
+});
+
+test("hardening: /token takes only application/x-www-form-urlencoded (RFC 6749), multipart is refused", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  const fd = new FormData();
+  fd.set("grant_type", "authorization_code");
+  const lookalike = new Headers({ "content-type": "application/x-www-form-urlencoded-x" });
+  for (const [body, headers] of [[fd, new Headers()], [JSON.stringify({ grant_type: "authorization_code" }), new Headers()],
+    ["grant_type=authorization_code", lookalike]] as const) {
+    const r = await worker.fetch(new Request(`${ORIGIN}/token`, { method: "POST", body, headers }), e);
+    assert.equal(r.status, 400);
+    assert.deepEqual(await r.json(), { error: "invalid_request" });
+  }
+  // the accepted form still reaches the grant logic (an unknown code is invalid_grant, not invalid_request)
+  const ok = await tokenPost(e, { grant_type: "authorization_code", code: "nope", code_verifier: VERIFIER,
+    redirect_uri: REDIRECT, client_id: CLIENT });
+  assert.notDeepEqual(await ok.json(), { error: "invalid_request" });
+  // media types are case-insensitive (RFC 9110 §8.3.1)
+  const upper = await worker.fetch(new Request(`${ORIGIN}/token`, {
+    method: "POST", headers: { "content-type": "APPLICATION/X-WWW-FORM-URLENCODED" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code: "nope", code_verifier: VERIFIER,
+      redirect_uri: REDIRECT, client_id: CLIENT }).toString(),
+  }), e);
+  assert.notDeepEqual(await upper.json(), { error: "invalid_request" });
 });
 
 test("hardening: pending requests are capped by evicting the OLDEST — a GET flood can't lock humans out", async () => {

@@ -14,13 +14,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      matrix:
+        node-version: ["22", "24"] # engines >=20; 24 is the current LTS users install
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node-version }}
       - name: Install (from the committed lockfile)
         run: npm ci
       - name: Test (builds, then runs the node:test suite)
