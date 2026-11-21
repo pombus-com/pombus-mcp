@@ -35,15 +35,12 @@ export class DurableObjectStore implements OAuthStoreLike {
 
   constructor(ns: DurableObjectNamespace) {
     // One fixed name → one DO instance for the whole Worker. Its input gate serializes every method, so
-    // the store's get-then-delete (takeCode/takeRequest) stays atomic across concurrent isolates.
+    // the store's check-then-write (takeCode/useRid) stays atomic across concurrent isolates.
     this.stub = ns.get(ns.idFromName("oauth"));
   }
 
-  putRequest(id: string, r: Parameters<OAuthStoreLike["putRequest"]>[1]): Promise<void> {
-    return this.stub.putRequest(id, r);
-  }
-  takeRequest(id: string): ReturnType<OAuthStoreLike["takeRequest"]> {
-    return this.stub.takeRequest(id);
+  useRid(ridHash: string, expiresAt: number): Promise<boolean> {
+    return this.stub.useRid(ridHash, expiresAt);
   }
   putCode(code: string, c: Parameters<OAuthStoreLike["putCode"]>[1]): Promise<boolean> {
     return this.stub.putCode(code, c);
@@ -79,12 +76,6 @@ export class DurableObjectStore implements OAuthStoreLike {
   }
   takeLink(linkToken: string): ReturnType<OAuthStoreLike["takeLink"]> {
     return this.stub.takeLink(linkToken);
-  }
-  putClient(clientId: string, redirectUris: readonly string[]): Promise<boolean> {
-    return this.stub.putClient(clientId, redirectUris);
-  }
-  getClient(clientId: string): ReturnType<OAuthStoreLike["getClient"]> {
-    return this.stub.getClient(clientId);
   }
   reset(): Promise<void> {
     return this.stub.reset();

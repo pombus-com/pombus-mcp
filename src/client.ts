@@ -94,12 +94,51 @@ export class CoreClient {
       body?: unknown;
     } = {},
   ): Promise<T> {
+    const res = await this.send(method, path, opts, "application/json");
+    if (res.status === 204) return undefined as T;
+    const text = await res.text();
+    if (!text) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new CoreError("bad_response", "core returned a non-JSON body");
+    }
+  }
+
+  /** GET a PNG (a rendered attachment page). Anything but `image/png` is refused: the bytes go to the
+   *  model as an image, so the type is checked here, not assumed. `pageCount` is the core's
+   *  `x-pombus-page-count` header when it is a plain number. */
+  async getPng(
+    path: string,
+    query?: Record<string, string | number | boolean | undefined>,
+  ): Promise<{ bytes: Uint8Array; pageCount: number | undefined }> {
+    const res = await this.send("GET", path, { query }, "image/png");
+    if ((res.headers.get("content-type") ?? "").split(";")[0]!.trim() !== "image/png") {
+      throw new CoreError("bad_response", "core returned a non-PNG body");
+    }
+    const count = res.headers.get("x-pombus-page-count") ?? "";
+    return {
+      bytes: new Uint8Array(await res.arrayBuffer()),
+      pageCount: /^[0-9]{1,8}$/.test(count) ? Number(count) : undefined,
+    };
+  }
+
+  /** One HTTP exchange -> the 2xx Response, or the CoreError the model may see. */
+  private async send(
+    method: HttpMethod,
+    path: string,
+    opts: {
+      query?: Record<string, string | number | boolean | undefined> | undefined;
+      body?: unknown;
+    },
+    accept: string,
+  ): Promise<Response> {
     const url = this.url(path, opts.query);
     const init: RequestInit = {
       method,
       headers: {
         authorization: `Bearer ${this.apiKey}`,
-        accept: "application/json",
+        accept,
         ...(opts.body !== undefined ? { "content-type": "application/json" } : {}),
       },
     };
@@ -115,16 +154,7 @@ export class CoreClient {
       throw new CoreError("network", `request failed: ${errName(e)}`);
     }
 
-    if (res.ok) {
-      if (res.status === 204) return undefined as T;
-      const text = await res.text();
-      if (!text) return undefined as T;
-      try {
-        return JSON.parse(text) as T;
-      } catch {
-        throw new CoreError("bad_response", "core returned a non-JSON body");
-      }
-    }
+    if (res.ok) return res;
 
     // Anti-enumeration: do NOT distinguish "forbidden" from "not found" to the model.
     if (res.status === 401 || res.status === 403 || res.status === 404) {

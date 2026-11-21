@@ -21,7 +21,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type WorkerEnv } from "./worker.js";
 import { OAuthStore, STORE_CAP, MAX_FORM_BYTES, type LiveToken, type RedeemedHandoff, type WebBinding } from "./oauth.js";
-import { FakeCore } from "../testutil.js";
+import { FakeCore, spyOn, sealToken } from "../testutil.js";
 
 const BASE = "https://core.test/v0";
 const CLIENT = "pombus-mcp";
@@ -29,6 +29,7 @@ const REDIRECT = "http://127.0.0.1:6274/oauth/callback";
 const ORIGIN = "https://mcp.test";
 const WEB_CONSENT = "https://mail.pombus.com/mcp/consent";
 const SECRET = "test_hmac_secret_shared_with_the_webmail_000";
+const STATE = "test_worker_only_state_secret_0000000000000";
 
 const ORG_A = "org_alpha";
 const ORG_B = "org_bravo";
@@ -84,6 +85,7 @@ function env(
     __store: store,
     WEB_CONSENT_URL: WEB_CONSENT,
     MCP_WEB_LINK_SECRET: SECRET,
+    MCP_STATE_SECRET: STATE,
     ...(web ? { __web: web } : {}),
   };
   if (omit.secret) delete e.MCP_WEB_LINK_SECRET;
@@ -518,16 +520,124 @@ test("hardening: /token takes only application/x-www-form-urlencoded (RFC 6749),
   assert.notDeepEqual(await upper.json(), { error: "invalid_request" });
 });
 
-test("hardening: pending requests are capped by evicting the OLDEST — a GET flood can't lock humans out", async () => {
+test("hardening: a /authorize flood rotating addresses inside ONE /56 is one limiter bucket, and a human's login still completes", async () => {
   CHALLENGE = await s256(VERIFIER);
-  const store = new OAuthStore();
-  const pending = () => ({
-    clientId: CLIENT, redirectUri: REDIRECT, state: "s", codeChallenge: CHALLENGE, scope: "", expiresAt: Date.now() + 60_000,
-  });
-  for (let i = 0; i < STORE_CAP; i++) await store.putRequest(`flood_${i}`, pending());
-  const e = env(store, fakeWeb({}));
-  const res = await authorizeGet(e, baseParams());
-  assert.equal(res.status, 302, "the human still gets a redirect");
-  assert.equal(await store.takeRequest("flood_0"), undefined, "the oldest flood entry made room");
-  assert.ok(await store.takeRequest("flood_1"), "the rest stays: the map never grows past the cap");
+  const counts = new Map<string, number>();
+  const RATE_LIMIT = {   // the Workers limiter: 30 a minute per key (wrangler.toml)
+    limit: async ({ key }: { key: string }) => {
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      return { success: (counts.get(key) ?? 0) <= 30 };
+    },
+  };
+  const e: WorkerEnv = { ...env(new OAuthStore(), fakeWeb({ h: { childKey: CHILD_A, orgId: ORG_A, perms: [], label: "A", ownerHash: OWNER } })), RATE_LIMIT };
+  const human = await startAuthorize({ ...e, RATE_LIMIT: { limit: async () => ({ success: true }) } });   // started first
+  const get = (ip: string) => {
+    const u = new URL(`${ORIGIN}/authorize`);
+    for (const [k, v] of Object.entries(baseParams())) u.searchParams.set(k, v);
+    return worker.fetch(new Request(u.toString(), { headers: { "cf-connecting-ip": ip } }), e);
+  };
+  let passed = 0;
+  for (let i = 1; i <= 200; i++) {   // 200 distinct addresses, all inside 2001:db8:a:b00::/56
+    if ((await get(`2001:db8:a:b${(i % 256).toString(16).padStart(2, "0")}::${i.toString(16)}`)).status !== 429) passed++;
+  }
+  assert.equal(passed, 30, "one /56 = one bucket");
+  assert.deepEqual([...counts.keys()], ["2001:db8:a:b00::/56:/authorize"]);
+  assert.equal((await completeAuthorize(e, human, "h")).status, 302, "the human's login survived the flood");
+});
+
+/** sign a rid payload exactly as the Worker does (label "mcp-rid-v1"). */
+const signRid = (secret: string, obj: Record<string, unknown>): Promise<string> => sealToken(secret, "mcp-rid-v1", obj);
+
+test("hardening: /authorize writes NOTHING to the store — a GET flood has nothing to fill or evict", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const { spy: store, calls } = spyOn(new OAuthStore());
+  const e = env(store, fakeWeb({ h: { childKey: CHILD_A, orgId: ORG_A, perms: [], label: "A", ownerHash: OWNER } }));
+  const human = await startAuthorize(e);                                  // a human starts first...
+  for (let i = 0; i < STORE_CAP + 50; i++) assert.equal((await authorizeGet(e, baseParams())).status, 302);
+  assert.deepEqual(calls, [], "no /authorize ever touched the store");
+  assert.equal((await completeAuthorize(e, human, "h")).status, 302, "...and still completes after the flood");
+});
+
+test("hardening: the rid is signed — tampered, expired, unsigned or a client_id-as-rid → 400; PREV still verifies", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  const good = await startAuthorize(e);
+  const [payload, sig] = good.split(".") as [string, string];
+  const base = { c: await s256(CLIENT), r: REDIRECT, s: "st", ch: CHALLENGE };
+  const evil = await signRid("not_our_secret_000000000000000000000000000", { ...base, e: Date.now() + 60_000 });
+  const tampered = `${(await signRid(STATE, { ...base, r: "https://evil.example/cb", e: Date.now() + 60_000 })).split(".")[0]}.${sig}`;
+  const expired = await signRid(STATE, { ...base, e: Date.now() - 1 });
+  // the rid's own payload re-signed with the right SECRET but the CLIENT label: the labels keep them apart
+  const ridSignedAsClient = `${payload}.${await hmac(await hmac(STATE, "mcp-client-v1"), payload)}`;
+  for (const rid of [tampered, expired, evil, ridSignedAsClient, "random_unsigned_rid", `${payload}.`]) {
+    assert.equal((await completeAuthorize(e, rid, "h")).status, 400, rid);
+  }
+  // rotation: a rid signed with the old secret survives the deploy that moves it to PREV
+  const old = await signRid(STATE, { ...base, e: Date.now() + 60_000 });
+  const rotated: WorkerEnv = { ...e, MCP_STATE_SECRET: "a_brand_new_state_secret_after_rotation_000", MCP_STATE_SECRET_PREV: STATE };
+  const ret = await completeAuthorize(rotated, old, "h");
+  assert.equal(ret.status, 302, "a rid signed with PREV is accepted");
+  assert.equal(new URL(ret.headers.get("location")!).searchParams.get("state"), "st");
+});
+
+test("hardening: /token binds the code to the client it was authorized for (another client_id → invalid_grant)", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({ h: { childKey: CHILD_A, orgId: ORG_A, perms: [], label: "A", ownerHash: OWNER } }));
+  const code = new URL((await completeAuthorize(e, await startAuthorize(e), "h")).headers.get("location")!).searchParams.get("code")!;
+  const res = await tokenPost(e, { grant_type: "authorization_code", code, code_verifier: VERIFIER, redirect_uri: REDIRECT,
+    client_id: "some-other-client" });
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), { error: "invalid_grant" });
+});
+
+test("hardening: the labels have teeth — the RIGHT shape under the OTHER kind's label is refused, both ways", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  const ridPayload = { c: await s256(CLIENT), r: REDIRECT, s: "st", ch: CHALLENGE, e: Date.now() + 60_000 };
+  assert.equal((await completeAuthorize(e, await signRid(STATE, ridPayload), "h")).status, 302, "control: a rid");
+  // a valid rid payload under the CLIENT label (a different state, so single-use cannot mask a mix-up)
+  assert.equal((await completeAuthorize(e, await sealToken(STATE, "mcp-client-v1", { ...ridPayload, s: "st2" }), "h")).status, 400);
+  // a valid client payload under the RID label, used as a client_id
+  const asRid = await sealToken(STATE, "mcp-rid-v1", { u: [REDIRECT] });
+  const res = await authorizeGet(e, { ...baseParams(), client_id: asRid });
+  assert.equal(res.status, 400);
+  assert.equal(await res.text(), "invalid_client");
+});
+
+test("hardening: an oversized link_token is dropped, never carried in the rid", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  const rid = await startAuthorize(e, { ...baseParams(), link_token: "L".repeat(2048) });
+  const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(rid.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/")
+    + "=".repeat((4 - (rid.split(".")[0]!.length % 4)) % 4)), (c) => c.charCodeAt(0)))) as Record<string, unknown>;
+  assert.ok(!("lt" in payload), "no lt in the rid");
+  assert.ok(rid.length < 1600);
+});
+
+test("hardening: state and scope are capped in BYTES (a 4-byte emoji counts 4), so the cookie stays under 4 KB", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  assert.equal((await authorizeGet(e, { ...baseParams(), state: "\u{1F600}".repeat(64) })).status, 302);   // 256 bytes
+  assert.equal((await authorizeGet(e, { ...baseParams(), state: "\u{1F600}".repeat(65) })).status, 400);   // 130 units, 260 bytes
+  assert.equal((await authorizeGet(e, { ...baseParams(), scope: "\u00e9".repeat(129) })).status, 400);     // 258 bytes
+});
+
+test("hardening: no state secret → /authorize fails closed (503), never an unsigned rid", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  const dynamic = await sealToken(STATE, "mcp-client-v1", { u: [REDIRECT] });
+  delete e.MCP_STATE_SECRET;
+  assert.equal((await authorizeGet(e, baseParams())).status, 503);
+  // a dynamic client_id cannot even be verified without the secret: 503 (unavailable), not invalid_client
+  assert.equal((await authorizeGet(e, { ...baseParams(), client_id: dynamic })).status, 503);
+});
+
+test("hardening: the rid stays small enough for URLs and the webmail consent cookie (capped inputs)", async () => {
+  CHALLENGE = await s256(VERIFIER);
+  const e = env(new OAuthStore(), fakeWeb({}));
+  const rid = await startAuthorize(e, { ...baseParams(), state: "s".repeat(256), scope: "x".repeat(256) });
+  assert.ok(rid.length < 1600, `rid is ${rid.length} chars`);
+  for (const [k, v] of [["state", "s".repeat(257)], ["scope", "x".repeat(257)]] as const) {
+    assert.equal((await authorizeGet(e, { ...baseParams(), [k]: v })).status, 400, k);
+  }
 });

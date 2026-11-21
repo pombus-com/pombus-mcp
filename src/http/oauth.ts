@@ -6,7 +6,7 @@
 // decision, exactly as an OAuth client delegates to an identity provider.
 //
 // The three Worker surfaces:
-//   - GET /authorize        : validate, stash a PendingRequest, 302 to the webmail consent URL (signed).
+//   - GET /authorize        : validate, sign the request into a stateless `rid`, 302 to the webmail consent URL.
 //   - GET /authorize/return : the webmail bounces back here (signed) with a single-use HANDOFF code; we
 //                             mint OUR authorization code bound to that handoff and 302 to the agent.
 //   - POST /token           : exchange code + PKCE verifier; REDEEM the handoff via the WEB service
@@ -19,7 +19,9 @@
 // Security invariants (audited black-box, AGENTS.md §5):
 //   - Fail-closed everywhere. validateAccessToken returns null on anything off.
 //   - PKCE S256 stays IN THE WORKER: the code_verifier is never sent to the webmail. `plain` is refused.
-//   - Single-use: pending request (rid), handoff, authorization code — each consumed exactly once.
+//   - Single-use: rid (useRid), handoff, authorization code — each consumed exactly once.
+//   - Nothing anonymous writes the store: the pending request (rid) and a dynamic client (client_id) are
+//     tokens signed with MCP_STATE_SECRET (Worker-only; PREV verifies during a rotation), not store rows.
 //   - redirect_uri exact-match against the client whitelist (no open redirect); state echoed.
 //   - HMAC signs both 302 hops (mcp-consent.<rid>.<ctx> outbound, mcp-complete.<rid>.<handoff> inbound)
 //     so a third party cannot forge a consent return NOR tamper with the signed ctx (scope + redirect
@@ -58,27 +60,15 @@ export const DEFAULT_CLIENTS: readonly OAuthClient[] = [
 // capped (STORE_CAP). Methods are async so OAuthStore (in-process) and DurableObjectStore (across the
 // DO boundary) share the ONE interface (OAuthStoreLike).
 
-export interface PendingRequest {
-  clientId: string;
-  redirectUri: string;
-  state: string;
-  codeChallenge: string;
-  /** The agent's requested scope hint, carried through to the webmail via the rid's server state (the
-   *  webmail reads it at redeem/consent-context, NOT off the URL). Back-compat / informational only. */
-  scope: string;
-  /** Present on the ADD-ORG flow: the link_token the agent carried to tie a new org to an EXISTING
-   *  access token (select_organization). Absent on a first authorization. */
-  linkToken?: string;
-  expiresAt: number;
-}
-
 export interface IssuedCode {
-  clientId: string;
+  /** sha256 (base64url) of the client_id the request was authorized for — a stateless client_id can be ~1 KB,
+   *  and the rid that carries this travels in URLs and the webmail's consent cookie. /token compares the hash. */
+  clientIdHash: string;
   redirectUri: string;
   codeChallenge: string;
   /** The single-use handoff the webmail minted; redeemed at /token for the child key. NOT the key. */
   handoffCode: string;
-  /** Carried from the PendingRequest through the code so /token knows this is an add-org exchange. */
+  /** The access token a link_token tied to (resolved at /authorize/return) — /token's add-org exchange. */
   linkToken?: string;
   expiresAt: number;
 }
@@ -102,13 +92,6 @@ export interface LiveToken {
   tokenExp: number;
 }
 
-/** A dynamically-registered client (RFC 7591). Same shape every stored map uses so the cap's sweep +
- *  eviction works unchanged; the TTL only bounds growth, it is not a security timer. */
-export interface RegisteredClient {
-  redirectUris: readonly string[];
-  expiresAt: number;
-}
-
 /** Ties a link_token to an existing access token (the ADD-ORG flow). Capped + single-use. Living in the
  *  store (not an HMAC of the access token) keeps it revocable and keeps the access token off the URL. */
 export interface LinkRecord {
@@ -116,9 +99,10 @@ export interface LinkRecord {
   expiresAt: number;
 }
 
-/** Ceiling per map (sec audit). Pending requests + clients + links EVICT the oldest when full (a flood
- *  only rolls the window, never locks a human out); codes and tokens — which need a real credential —
- *  are refused instead, so no live grant is dropped. */
+/** Ceiling per map (sec audit). Links and used rids EVICT the oldest when full; codes and tokens — which
+ *  need a real credential — are refused instead, so no live grant is dropped. Nothing here is written by an
+ *  anonymous request any more: pending requests and dynamic clients are signed tokens (no store), and every
+ *  write left happens after a human consented on the webmail or holds a valid access token. */
 export const STORE_CAP = 1000;
 
 function hasRoom<T extends { expiresAt: number }>(m: Map<string, T>): boolean {
@@ -131,8 +115,8 @@ function hasRoom<T extends { expiresAt: number }>(m: Map<string, T>): boolean {
 /** The store contract, async on EVERY method so the in-process OAuthStore and the across-the-DO-boundary
  *  DurableObjectStore both satisfy it and the handlers await without knowing which side they are on. */
 export interface OAuthStoreLike {
-  putRequest(id: string, r: PendingRequest): Promise<void>;
-  takeRequest(id: string): Promise<PendingRequest | undefined>;
+  /** Mark a (hashed) rid as used; false when it already was — the rid is a signed token, single-use by this. */
+  useRid(ridHash: string, expiresAt: number): Promise<boolean>;
   putCode(code: string, c: IssuedCode): Promise<boolean>;
   takeCode(code: string): Promise<IssuedCode | undefined>;
   tokenRoom(): Promise<boolean>;
@@ -152,28 +136,24 @@ export interface OAuthStoreLike {
   putLink(linkToken: string, accessToken: string): Promise<boolean>;
   /** Resolve-and-consume a link_token → the access token it was tied to (single-use). */
   takeLink(linkToken: string): Promise<string | undefined>;
-  putClient(clientId: string, redirectUris: readonly string[]): Promise<boolean>;
-  getClient(clientId: string): Promise<readonly string[] | undefined>;
   reset(): Promise<void>;
 }
 
 export class OAuthStore implements OAuthStoreLike {
-  private readonly requests = new Map<string, PendingRequest>();
+  private readonly usedRids = new Map<string, { expiresAt: number }>();
   private readonly codes = new Map<string, IssuedCode>();
   private readonly tokens = new Map<string, LiveToken>();
   private readonly links = new Map<string, LinkRecord>();
-  private readonly clients = new Map<string, RegisteredClient>();
 
-  async putRequest(id: string, r: PendingRequest): Promise<void> {
-    if (!hasRoom(this.requests)) this.requests.delete(this.requests.keys().next().value!);
-    this.requests.set(id, r);
-  }
-  async takeRequest(id: string): Promise<PendingRequest | undefined> {
-    const r = this.requests.get(id);
-    if (!r) return undefined;
-    this.requests.delete(id);
-    if (r.expiresAt < Date.now()) return undefined;
-    return r;
+  /** Written only by /authorize/return AFTER the webmail's signature checked (a human consented), so a flood
+   *  cannot reach it; full → evict the oldest. An evicted rid's return URL could be replayed (the webmail's
+   *  signature is deterministic) — what still contains that is the handoff, single-use on the webmail side
+   *  (a second /token redeem finds nothing), plus PKCE: only the agent holding the verifier can exchange a code. */
+  async useRid(ridHash: string, expiresAt: number): Promise<boolean> {
+    if (this.usedRids.has(ridHash)) return false;
+    if (!hasRoom(this.usedRids)) this.usedRids.delete(this.usedRids.keys().next().value!);
+    this.usedRids.set(ridHash, { expiresAt });
+    return true;
   }
   async putCode(code: string, c: IssuedCode): Promise<boolean> {
     if (!hasRoom(this.codes)) return false;
@@ -191,8 +171,8 @@ export class OAuthStore implements OAuthStoreLike {
   }
   /** Checked BEFORE /token builds a token-set, so a full store never strands a freshly redeemed key. The
    *  token map is keyed on `tokenExp` (not the shared `expiresAt`), so it sweeps its own expired sets
-   *  before judging room — no eviction of a live grant (unlike pending requests, a token is refused when
-   *  truly full, so nobody's active session is dropped). */
+   *  before judging room — no eviction of a live grant (a token is refused when truly full, so nobody's
+   *  active session is dropped). */
   async tokenRoom(): Promise<boolean> {
     if (this.tokens.size < STORE_CAP) return true;
     const now = Date.now();
@@ -247,29 +227,12 @@ export class OAuthStore implements OAuthStoreLike {
     if (l.expiresAt < Date.now()) return undefined;
     return l.accessToken;
   }
-  /** /register is PUBLIC — cap it like pending requests: sweep, then EVICT the oldest rather than refuse,
-   *  so a flood only rolls the window. Never returns false in practice; the boolean keeps putCode's shape. */
-  async putClient(clientId: string, redirectUris: readonly string[]): Promise<boolean> {
-    if (!hasRoom(this.clients)) this.clients.delete(this.clients.keys().next().value!);
-    this.clients.set(clientId, { redirectUris, expiresAt: Date.now() + REGISTER_TTL_MS });
-    return true;
-  }
-  async getClient(clientId: string): Promise<readonly string[] | undefined> {
-    const c = this.clients.get(clientId);
-    if (!c) return undefined;
-    if (c.expiresAt < Date.now()) {
-      this.clients.delete(clientId);
-      return undefined;
-    }
-    return c.redirectUris;
-  }
   /** Test seam: wipe everything between cases. */
   async reset(): Promise<void> {
-    this.requests.clear();
+    this.usedRids.clear();
     this.codes.clear();
     this.tokens.clear();
     this.links.clear();
-    this.clients.clear();
   }
 }
 
@@ -281,7 +244,12 @@ export const store = new OAuthStore();
 const REQUEST_TTL_MS = 10 * 60 * 1000; // a human has 10 min to finish consent on the webmail
 const CODE_TTL_MS = 60 * 1000;         // authorization code: 60s, single-use
 const TOKEN_TTL_MS = 60 * 60 * 1000;   // access token + minted child keys: 1h
-const REGISTER_TTL_MS = 30 * 24 * 60 * 60 * 1000; // a dynamic client registration (bounds growth only)
+// Caps that keep the signed rid small: it rides the consent URL, the return URL and the webmail's consent cookie.
+const MAX_STATE = 256;
+const MAX_SCOPE = 256;
+const MAX_REDIRECT = 512;
+const MAX_DCR_URIS = 5;
+const MAX_DCR_JSON = 1024;   // the signed client_id carries its redirect_uris
 
 // --- crypto helpers (Web Crypto, present in Workers and Node >=20) --------------------------------
 
@@ -322,6 +290,43 @@ async function hmac(secret: string, message: string): Promise<string> {
   return b64url(new Uint8Array(sig));
 }
 
+function b64urlDecode(s: string): Uint8Array | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(s)) return null;
+  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+/** A signed stateless token: `b64url(JSON) . HMAC(HMAC(secret, label), payload)`. The label separates the
+ *  rid from the client_id (a token minted as one never verifies as the other). Signed with the CURRENT secret
+ *  (the first); verified against current and PREVIOUS, so a rotation never breaks an in-flight token. */
+async function seal(secrets: readonly string[], label: string, obj: unknown): Promise<string> {
+  const payload = b64url(new TextEncoder().encode(JSON.stringify(obj)));
+  return `${payload}.${await hmac(await hmac(secrets[0] ?? "", label), payload)}`;
+}
+
+/** The object a seal() token carries, or null when malformed, unsigned or signed with an unknown key. */
+async function unseal(secrets: readonly string[], label: string, token: string): Promise<Record<string, unknown> | null> {
+  const parts = token.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const [payload, sig] = parts as [string, string];
+  let ok = false;
+  for (const s of secrets) if (timingSafeEqual(sig, await hmac(await hmac(s, label), payload))) ok = true;
+  if (!ok) return null;
+  const bytes = b64urlDecode(payload);
+  if (!bytes) return null;
+  try {
+    const o: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    return o !== null && typeof o === "object" && !Array.isArray(o) ? (o as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+const RID_LABEL = "mcp-rid-v1";
+const CLIENT_LABEL = "mcp-client-v1";
+
+const utf8Len = (s: string): number => new TextEncoder().encode(s).length;
+
 /** Constant-time string compare (timing-oracle fence on code_challenge / signatures). Both operands are
  *  base64url, so byte length equals char length. */
 function timingSafeEqual(a: string, b: string): boolean {
@@ -337,15 +342,18 @@ function findClient(clients: readonly OAuthClient[], clientId: string): OAuthCli
   return clients.find((c) => c.clientId === clientId);
 }
 
-/** Resolve a client_id: the FIXED registry first, then a DYNAMICALLY-REGISTERED client (RFC 7591). A
- *  registered client is its stored redirect_uris in the same shape, so the exact-match fence runs
- *  identically. Unknown → undefined (fail-closed). */
+/** Resolve a client_id: the FIXED registry first, then a DYNAMIC client (RFC 7591), which is now the SIGNED
+ *  client_id itself carrying its redirect_uris — nothing stored, so /register writes nothing and a
+ *  registration survives deploys. Unsigned, tampered or unknown-key → undefined (fail-closed). */
 async function resolveClient(deps: OAuthDeps, clientId: string): Promise<OAuthClient | undefined> {
   const fixed = findClient(deps.clients, clientId);
   if (fixed) return fixed;
-  const uris = await deps.store.getClient(clientId);
-  if (uris) return { clientId, redirectUris: uris };
-  return undefined;
+  if (!deps.stateSecrets?.length) return undefined;
+  const c = await unseal(deps.stateSecrets, CLIENT_LABEL, clientId);
+  const u = c?.["u"];
+  // the same redirect fence /register applied: a client_id can never carry a uri /register would refuse
+  if (!Array.isArray(u) || u.length === 0 || !u.every(isAllowedRedirectUri)) return undefined;
+  return { clientId, redirectUris: u as string[] };
 }
 
 /** redirect_uri exact-match against the client's whitelist — byte-identical or rejected (open-redirect fence). */
@@ -471,15 +479,19 @@ export interface OAuthDeps {
   webConsentUrl?: string;
   /** The HMAC secret shared with the webmail. Absent → cannot sign/verify the 302 hops → fail-closed. */
   webLinkSecret?: string;
+  /** The Worker-only secrets that sign the stateless rid and client_id: [current, previous?]. Signs with the
+   *  first, verifies with both (rotation). Empty/absent → /authorize and /register fail closed (503). */
+  stateSecrets?: readonly string[];
   /** The WEB service binding used to redeem a handoff at /token. Absent → /token cannot mint → 503. */
   web?: WebBinding;
 }
 
 // --- GET /authorize (delegating front-end) --------------------------------------------------------
 
-/** Validate the authorization request and 302 to the WEBMAIL consent screen. Everything that must stay
- *  server-side — client, redirect_uri, PKCE challenge, state — is stashed in a single-use PendingRequest
- *  under a random `rid`; only `rid` + an HMAC signature travel to the webmail. Rejects (400, no redirect)
+/** Validate the authorization request and 302 to the WEBMAIL consent screen. The request (client hash,
+ *  redirect_uri, PKCE challenge, state, scope, link_token) travels as a SIGNED `rid` — nothing is written to
+ *  the store, so an anonymous flood of /authorize has nothing to fill or evict. None of it is secret (all of
+ *  it is on this very URL); the signature makes it tamper-evident, and /authorize/return makes it single-use. Rejects (400, no redirect)
  *  when the client/redirect_uri is unknown; 400 for every other protocol error (the request never
  *  reached a trusted redirect). Fail-closed: no webmail secret/URL configured → 503, never a redirect. */
 export async function handleAuthorizeGet(req: Request, deps: OAuthDeps): Promise<Response> {
@@ -494,44 +506,38 @@ export async function handleAuthorizeGet(req: Request, deps: OAuthDeps): Promise
   const scope = q.get("scope") ?? "";
   const linkTokenRaw = q.get("link_token") ?? "";
 
+  if (!deps.stateSecrets?.length) return unavailable();   // cannot verify a dynamic client_id nor sign a rid
   const client = await resolveClient(deps, clientId);
   if (!client) return badRequest("invalid_client");
   if (!redirectAllowed(client, redirectUri)) return badRequest("invalid_redirect_uri");
   if (responseType !== "code") return badRequest("unsupported_response_type");
   if (method !== "S256") return badRequest("invalid_pkce"); // plain is forbidden (OAuth 2.1)
   if (!/^[A-Za-z0-9\-._~]{43,128}$/.test(codeChallenge)) return badRequest("invalid_pkce");
-  if (!state) return badRequest("invalid_state");
+  // Caps in BYTES (UTF-8), not UTF-16 units: the rid rides the webmail's consent cookie (4 KB).
+  if (!state || utf8Len(state) > MAX_STATE) return badRequest("invalid_state");
+  if (utf8Len(scope) > MAX_SCOPE) return badRequest("invalid_scope");
 
   // Fail-closed: without the webmail consent URL and the shared secret we cannot delegate OR sign the
   // hop — refuse rather than bounce somewhere unsigned. 503 is honest ("unavailable"), not an oracle.
   if (!deps.webConsentUrl || !deps.webLinkSecret) return unavailable();
 
-  // The ADD-ORG flow (select_organization): if a valid link_token is present, consume it and carry the
-  // tied access token into the PendingRequest so /token attaches the new org to the SAME access token.
-  // An invalid/expired link_token is simply ignored (treated as a first authorization) — never an error
-  // that would tell an attacker whether a link_token exists.
-  let linkToken: string | undefined;
-  if (linkTokenRaw) {
-    const tied = await deps.store.takeLink(linkTokenRaw);
-    if (tied) linkToken = tied;
-  }
-
-  const rid = randomToken();
-  await deps.store.putRequest(rid, {
-    clientId,
-    redirectUri,
-    state,
-    codeChallenge,
-    scope,
-    ...(linkToken !== undefined ? { linkToken } : {}),
-    expiresAt: Date.now() + REQUEST_TTL_MS,
+  // The ADD-ORG flow (select_organization): the RAW link_token rides the rid and is consumed at
+  // /authorize/return — resolving it here would put the ACCESS token it ties to into a URL. Only a
+  // well-formed one is carried (an odd one is dropped: treated as a first authorization, never an error).
+  const linkToken = /^[A-Za-z0-9_-]{1,64}$/.test(linkTokenRaw) ? linkTokenRaw : undefined;   // minted: 43 b64url
+  const rid = await seal(deps.stateSecrets, RID_LABEL, {
+    c: await s256(clientId),
+    r: redirectUri,
+    s: state,
+    ch: codeChallenge,
+    ...(linkToken !== undefined ? { lt: linkToken } : {}),
+    e: Date.now() + REQUEST_TTL_MS,
   });
 
   // The webmail needs the scope (to pre-check the toggles) and the agent's host (to show "who is
   // asking") — and there is no reverse channel. We carry that context SIGNED on the 302: scope and
   // redirect host are not secrets (OAuth already puts scope/redirect on the authorize URL), and
-  // folding the ctx into the HMAC input makes it tamper-evident. PKCE/redirect_uri/client/state stay
-  // in the Worker's PendingRequest and never travel.
+  // folding the ctx into the HMAC input makes it tamper-evident. The rid is opaque to the webmail.
   const ctx = b64url(new TextEncoder().encode(JSON.stringify({ scope, redirectHost: new URL(redirectUri).host })));
   const sig = await hmac(deps.webLinkSecret, `mcp-consent.${rid}.${ctx}`);
   const consent = new URL(deps.webConsentUrl);
@@ -544,7 +550,7 @@ export async function handleAuthorizeGet(req: Request, deps: OAuthDeps): Promise
 // --- GET /authorize/return (webmail → worker) -----------------------------------------------------
 
 /** The webmail bounces the human back here after consent, carrying the single-use `handoff` it minted,
- *  signed with mcp-complete.<rid>.<handoff>. We verify the signature, consume the PendingRequest (rid),
+ *  signed with mcp-complete.<rid>.<handoff>. We verify that signature AND the rid's own, consume the rid,
  *  and issue OUR authorization code bound to redirect_uri + PKCE challenge + the handoff. Then 302 to the
  *  agent's redirect_uri with ?code&state (exact-match already proven — no open redirect). A bad signature
  *  or unknown rid is a bare 400 (no redirect — we have nothing trusted to bounce to). */
@@ -560,24 +566,33 @@ export async function handleAuthorizeReturn(req: Request, deps: OAuthDeps): Prom
   const expected = await hmac(deps.webLinkSecret, `mcp-complete.${rid}.${handoff}`);
   if (!timingSafeEqual(sig, expected)) return badRequest("invalid_request"); // forged return
 
-  const pending = await deps.store.takeRequest(rid); // single-use
-  if (!pending) return badRequest("invalid_request");
+  // The rid is OUR signed request: the client and redirect_uri were checked at /authorize before it was
+  // signed, so a valid signature is that check. Expired → refuse; a second use → refuse (useRid).
+  if (!deps.stateSecrets?.length) return unavailable();
+  const p = await unseal(deps.stateSecrets, RID_LABEL, rid);
+  const [c, r, s, ch, e, lt] = [p?.["c"], p?.["r"], p?.["s"], p?.["ch"], p?.["e"], p?.["lt"]];
+  if (typeof c !== "string" || typeof r !== "string" || typeof s !== "string" || typeof ch !== "string"
+      || typeof e !== "number") {
+    return badRequest("invalid_request");
+  }
+  if (e < Date.now()) return badRequest("invalid_request");
+  if (!(await deps.store.useRid(await s256(rid), e))) return badRequest("invalid_request"); // single-use
 
-  // Re-check the client/redirect defensively (fail-closed) before building any redirect.
-  const client = await resolveClient(deps, pending.clientId);
-  if (!client || !redirectAllowed(client, pending.redirectUri)) return badRequest("invalid_request");
+  // ADD-ORG: consume the link_token now (single-use) → the access token it ties to. Unknown/expired is
+  // treated as a first authorization, exactly as before (never an oracle on whether it existed).
+  const linkToken = typeof lt === "string" ? await deps.store.takeLink(lt) : undefined;
 
   const code = randomToken();
   const ok = await deps.store.putCode(code, {
-    clientId: pending.clientId,
-    redirectUri: pending.redirectUri,
-    codeChallenge: pending.codeChallenge,
+    clientIdHash: c,
+    redirectUri: r,
+    codeChallenge: ch,
     handoffCode: handoff,
-    ...(pending.linkToken !== undefined ? { linkToken: pending.linkToken } : {}),
+    ...(linkToken !== undefined ? { linkToken } : {}),
     expiresAt: Date.now() + CODE_TTL_MS,
   });
-  if (!ok) return oauthRedirect(pending.redirectUri, { error: "temporarily_unavailable", state: pending.state });
-  return oauthRedirect(pending.redirectUri, { code, state: pending.state });
+  if (!ok) return oauthRedirect(r, { error: "temporarily_unavailable", state: s });
+  return oauthRedirect(r, { code, state: s });
 }
 
 // --- POST /token (redeem via the WEB service binding) ---------------------------------------------
@@ -604,7 +619,7 @@ export async function handleToken(req: Request, deps: OAuthDeps): Promise<Respon
   if (!(await deps.store.tokenRoom())) return unavailable();
   const issued = await deps.store.takeCode(code); // single-use
   if (!issued) return tokenError("invalid_grant");
-  if (issued.clientId !== clientId) return tokenError("invalid_grant");
+  if (!timingSafeEqual(issued.clientIdHash, await s256(clientId))) return tokenError("invalid_grant");
   if (issued.redirectUri !== redirectUri) return tokenError("invalid_grant");
   if (!/^[A-Za-z0-9\-._~]{43,128}$/.test(verifier)) return tokenError("invalid_grant");
   const computed = await s256(verifier);
@@ -643,8 +658,8 @@ export async function handleToken(req: Request, deps: OAuthDeps): Promise<Respon
   }
 
   // Add-org: resolve the existing access token the link_token was tied to, and attach ONLY if the
-  // redeem's ownerHash matches the token's owner. The link_token was already consumed at /authorize;
-  // here we resolve it to the access token it carried through the PendingRequest → IssuedCode.
+  // redeem's ownerHash matches the token's owner. The link_token was consumed at /authorize/return, which
+  // put the access token it tied to into the IssuedCode.
   const accessToken = issued.linkToken;
   const attached = await deps.store.attachOrg(accessToken, redeemed.orgId, entry, redeemed.ownerHash);
   if (!attached) return tokenError("invalid_grant"); // owner mismatch or token gone — never grafts
@@ -689,24 +704,27 @@ function isAllowedRedirectUri(raw: unknown): boolean {
   return false;
 }
 
-/** Handle POST /register. Validates redirect_uris, generates a random public client_id, stores the
- *  registration (capped), returns 201 with the RFC 7591 client-information fields. No secret issued —
- *  PKCE authenticates the exchange. Nothing is logged. */
+/** Handle POST /register. Validates redirect_uris and returns a SIGNED public client_id that carries them
+ *  (RFC 7591 client-information fields, 201). Nothing is stored: a flood of /register fills nothing, and the
+ *  registration survives deploys. No secret issued — PKCE authenticates the exchange. Nothing is logged. */
 export async function handleRegister(req: Request, deps: OAuthDeps): Promise<Response> {
+  if (!deps.stateSecrets?.length) return unavailable();
   const body = await readJsonCapped(req);
   if (!body) return registerError("invalid_client_metadata");
 
   const redirectUris = body["redirect_uris"];
-  if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
+  if (!Array.isArray(redirectUris) || redirectUris.length === 0 || redirectUris.length > MAX_DCR_URIS) {
     return registerError("invalid_redirect_uri");
   }
   for (const uri of redirectUris) {
     if (!isAllowedRedirectUri(uri)) return registerError("invalid_redirect_uri");
   }
   const uris = redirectUris as string[];
+  if (uris.some((u) => u.length > MAX_REDIRECT) || JSON.stringify(uris).length > MAX_DCR_JSON) {
+    return registerError("invalid_redirect_uri");
+  }
 
-  const clientId = randomToken(); // public, high-entropy; no secret
-  await deps.store.putClient(clientId, uris);
+  const clientId = await seal(deps.stateSecrets, CLIENT_LABEL, { u: uris }); // public; no secret
 
   return new Response(
     JSON.stringify({

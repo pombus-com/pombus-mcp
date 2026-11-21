@@ -14,11 +14,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { type WorkerEnv } from "./worker.js";
 import { OAuthStore, type OAuthStoreLike } from "./oauth.js";
-import { FakeCore, type ProgrammedReply } from "../testutil.js";
+import { FakeCore, hmacB64 as hmac, sealToken, type ProgrammedReply } from "../testutil.js";
 
 const BASE = "https://core.test/v0";
 const WEB_CONSENT = "https://mail.pombus.com/mcp/consent";
 const SECRET = "test_hmac_secret_shared_with_the_webmail_000";
+const STATE = "test_worker_only_state_secret_0000000000000";
+
 
 function recordingCore(): FakeCore {
   return new FakeCore().on("GET", (u) => u.pathname.endsWith("/auth/me"), (): ProgrammedReply => ({
@@ -33,8 +35,7 @@ function recordingCore(): FakeCore {
 function rejectingStore(): OAuthStoreLike {
   const down = (): Promise<never> => Promise.reject(new Error("DO unavailable: stack must never leak"));
   return {
-    putRequest: down,
-    takeRequest: down,
+    useRid: down,
     putCode: down,
     takeCode: down,
     tokenRoom: down,
@@ -45,8 +46,6 @@ function rejectingStore(): OAuthStoreLike {
     getActiveChild: down,
     putLink: down,
     takeLink: down,
-    putClient: down,
-    getClient: down,
     reset: down,
   };
 }
@@ -68,20 +67,23 @@ test("worker: MCP request (Bearer) + store that rejects on getActiveChild → co
   assert.equal(core.requests.length, 0, "the core is never touched when the store is down");
 });
 
-test("worker: GET /authorize + store that rejects on putRequest → the SAME content-free 503", async () => {
+test("worker: GET /authorize/return + store that rejects on useRid → the SAME content-free 503", async () => {
   const core = recordingCore();
   const e: WorkerEnv = {
     POMBUS_API_BASE: BASE, __coreFetch: core.fetch, __store: rejectingStore(),
-    WEB_CONSENT_URL: WEB_CONSENT, MCP_WEB_LINK_SECRET: SECRET,
+    WEB_CONSENT_URL: WEB_CONSENT, MCP_WEB_LINK_SECRET: SECRET, MCP_STATE_SECRET: STATE,
   };
-  const u = new URL("https://mcp.test/authorize");
-  for (const [k, v] of Object.entries({
-    client_id: "pombus-mcp", redirect_uri: "http://127.0.0.1:6274/oauth/callback",
-    response_type: "code", code_challenge: "a".repeat(43), code_challenge_method: "S256", state: "s",
-  })) u.searchParams.set(k, v);
+  // a VALID rid and a VALID webmail signature: the first store call (useRid) is what rejects
+  const rid = await sealToken(STATE, "mcp-rid-v1", {
+    c: "x", r: "http://127.0.0.1:6274/oauth/callback", s: "s", ch: "a".repeat(43), e: Date.now() + 60_000,
+  });
+  const u = new URL("https://mcp.test/authorize/return");
+  u.searchParams.set("rid", rid);
+  u.searchParams.set("handoff", "h");
+  u.searchParams.set("sig", await hmac(SECRET, `mcp-complete.${rid}.h`));
   const res = await worker.fetch(new Request(u.toString(), { method: "GET" }), e);
-  // resolveClient / putRequest REJECTS → the throw hits the top-level catch → uniform 503.
-  assert.equal(res.status, 503, "a store failure on /authorize must be the SAME uniform 503");
+  // useRid REJECTS → the throw hits the top-level catch → uniform 503.
+  assert.equal(res.status, 503, "a store failure on /authorize/return must be the SAME uniform 503");
   assert.equal(await res.text(), "", "the 503 carries no body");
   assert.ok(res.headers.get("retry-after"), "a Retry-After must be set");
   assert.equal(core.requests.length, 0, "the core is never touched when the store is down");

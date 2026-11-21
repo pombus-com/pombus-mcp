@@ -125,7 +125,7 @@ test("Bearer: a valid access token lists the catalogue PLUS the two org tools; t
   assert.ok(names.has("list_organizations"), "list_organizations is exposed on the Bearer path");
   assert.ok(names.has("select_organization"), "select_organization is exposed on the Bearer path");
   assert.ok(names.has("list_inboxes"), "the REST catalogue is still exposed");
-  assert.equal(names.size, 55, `master Bearer must expose 53 REST + 2 org tools = 55, got ${names.size}`);
+  assert.equal(names.size, 57, `master Bearer must expose 55 REST + 2 org tools = 57, got ${names.size}`);
   // The ACTIVE org's child key — not the opaque access token — is the credential the core sees.
   const authMe = core.requests.find((r) => r.url.endsWith("/auth/me"));
   assert.equal(authMe?.headers["authorization"], `Bearer ${CHILD_A}`, "the core must see the active org's child key");
@@ -145,7 +145,7 @@ test("x-api-key: the header is the credential (one org); org tools are NOT expos
   const names = await listToolNames(e, { "x-api-key": DIRECT_KEY });
   assert.ok(!names.has("list_organizations"), "org tools must be HIDDEN on the x-api-key path");
   assert.ok(!names.has("select_organization"), "org tools must be HIDDEN on the x-api-key path");
-  assert.equal(names.size, 53, `master x-api-key must expose exactly 53 tools, got ${names.size}`);
+  assert.equal(names.size, 55, `master x-api-key must expose exactly 55 tools, got ${names.size}`);
   // The pod-key in the header is the credential sent to the core directly (no token-set lookup).
   const authMe = core.requests.find((r) => r.url.endsWith("/auth/me"));
   assert.equal(authMe?.headers["authorization"], `Bearer ${DIRECT_KEY}`, "the x-api-key value is the core credential");
@@ -263,6 +263,13 @@ test("rate limit: the public OAuth routes are keyed per IP+route; a refused call
   // the MCP endpoint itself and discovery are not on this limiter
   await worker.fetch(new Request("https://mcp.pombus.com/.well-known/oauth-authorization-server"), e);
   assert.equal(keys.length, 3);
+  // IPv6: keyed by the /56 (ipBucket), so a rotating address inside it is the same caller
+  keys.length = 0;
+  for (const ip of ["2001:db8:a:b00::1", "2001:db8:a:bff:dead:beef:1:2"]) {
+    await worker.fetch(new Request("https://mcp.pombus.com/register", {
+      method: "POST", headers: { "cf-connecting-ip": ip, "content-type": "application/json" }, body: "{}" }), e);
+  }
+  assert.deepEqual(keys, ["2001:db8:a:b00::/56:/register", "2001:db8:a:b00::/56:/register"]);
   // under the limit, the route answers as usual (here: /register validates the body)
   const ok = { limit: async () => ({ success: true }) };
   const res = await worker.fetch(new Request("https://mcp.pombus.com/register", {

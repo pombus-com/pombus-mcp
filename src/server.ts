@@ -23,12 +23,14 @@ import {
   callOrgTool,
   isOrgTool,
   ToolArgError,
+  PageImage,
+  SERVER_INSTRUCTIONS,
   type ToolContext,
 } from "./tools.js";
 import type { OAuthStoreLike } from "./http/oauth.js";
 
 const SERVER_NAME = "pombus";
-const SERVER_VERSION = "0.1.8";
+const SERVER_VERSION = "0.1.9";
 
 /** Build and connect the MCP server over stdio. Without a key the server still comes up for
  *  introspection (registries such as Glama boot it with no credential to read the catalog): it lists
@@ -91,8 +93,11 @@ function keylessServer(): Server {
   return server;
 }
 
+/** Every server (stdio, keyless, the remote worker) answers initialize with the sender-signal rules as
+ *  `instructions`: the one place every MCP client reads before any tool. */
 function newServer(): Server {
-  return new Server({ name: SERVER_NAME, version: SERVER_VERSION }, { capabilities: { tools: {} } });
+  return new Server({ name: SERVER_NAME, version: SERVER_VERSION },
+    { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS });
 }
 
 function boundServer(client: CoreClient, scope: ScopeBinding, opts: BuildServerOpts): Server {
@@ -123,6 +128,15 @@ function boundServer(client: CoreClient, scope: ScopeBinding, opts: BuildServerO
       const spec = specByName(name, scope);
       if (!spec) return toolError(`unknown tool: ${name}`);
       const value = await callTool(spec, args, ctx);
+      if (value instanceof PageImage) {
+        // The image first, then what it is -- fenced as untrusted like every other result.
+        return {
+          content: [
+            { type: "image", data: toBase64(value.png), mimeType: "image/png" },
+            { type: "text", text: toText(value.info) },
+          ],
+        };
+      }
       return { content: [{ type: "text", text: toText(value) }] };
     } catch (e) {
       return toolError(modelError(e));
@@ -150,6 +164,16 @@ export function toText(value: unknown): string {
   const json = (value === undefined ? JSON.stringify({ ok: true }) : JSON.stringify(value))
     .replace(FENCE_LOOKALIKE, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
   return `${UNTRUSTED_NOTE}\n<pombus-data>\n${json}\n</pombus-data>`;
+}
+
+/** Bytes -> base64 with the platform's btoa (Node and workerd both have it; no Buffer in workerd).
+ *  Chunked: String.fromCharCode takes a bounded number of arguments. */
+export function toBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
 }
 
 /** A CallTool result flagged as an error (isError), carrying model-facing en-US text. */

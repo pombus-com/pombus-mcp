@@ -18,6 +18,9 @@ export interface CapturedRequest {
 export interface ProgrammedReply {
   status?: number;
   json?: unknown;
+  /** A binary body (a rendered page) with its own headers, instead of `json`. */
+  bytes?: Uint8Array;
+  headers?: Record<string, string>;
 }
 
 /** Match a request by method + a path predicate; returns the reply to send. */
@@ -26,6 +29,39 @@ export type Route = {
   match: (url: URL) => boolean;
   reply: ProgrammedReply | ((req: CapturedRequest, url: URL) => ProgrammedReply);
 };
+
+/** HMAC-SHA256(secret, message) → base64url, as the Worker and the webmail sign. */
+export async function hmacB64(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+  let s = "";
+  for (const b of sig) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Seal a stateless token exactly as the Worker does: b64url(JSON) . HMAC(HMAC(secret, label), payload). The
+ *  label is a PARAMETER (not imported from the Worker), so a test can sign under the other kind's label. */
+export async function sealToken(secret: string, label: string, obj: unknown): Promise<string> {
+  const json = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = "";
+  for (const b of json) bin += String.fromCharCode(b);
+  const payload = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${payload}.${await hmacB64(await hmacB64(secret, label), payload)}`;
+}
+
+/** Wrap an object so every method call is recorded by name — proves a route never touches the store. */
+export function spyOn<T extends object>(target: T): { spy: T; calls: string[] } {
+  const calls: string[] = [];
+  const spy = new Proxy(target, {
+    get(t, k, r) {
+      const v = Reflect.get(t, k, r) as unknown;
+      return typeof v === "function"
+        ? (...a: unknown[]) => { calls.push(String(k)); return (v as (...x: unknown[]) => unknown).apply(t, a); }
+        : v;
+    },
+  });
+  return { spy, calls };
+}
 
 export class FakeCore {
   readonly requests: CapturedRequest[] = [];
@@ -86,6 +122,9 @@ function makeResponse(reply: ProgrammedReply): Response {
   // A 204/205 MUST have a null body (undici throws on any body, even ""), matching the real core's
   // no-content replies (e.g. a DELETE).
   const nullBodyStatus = status === 204 || status === 205 || status === 304;
+  if (reply.bytes !== undefined) {
+    return new Response(reply.bytes, { status, headers: reply.headers ?? {} });
+  }
   const body = hasBody ? JSON.stringify(reply.json) : nullBodyStatus ? null : "";
   return new Response(body, {
     status,

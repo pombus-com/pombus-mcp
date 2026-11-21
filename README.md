@@ -68,7 +68,7 @@ It makes no network request until a key is set.
 
 ## The tools are gated by your key
 
-The server exposes a catalog of 53 tools — list and read threads, search, label,
+The server exposes a catalog of 55 tools — list and read threads, search, label,
 compose and send drafts, manage lists, read metrics. But **your API key decides
 what the agent actually sees.** A tool is only registered when the key holds the
 permission that tool needs; a key without send permission never sees a send

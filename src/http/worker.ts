@@ -40,6 +40,7 @@ import {
 } from "./oauth.js";
 import { DurableObjectStore, type DurableObjectNamespace } from "./store-do.js";
 import { renderRoot } from "./root.js";
+import { ipBucket } from "./ipBucket.js";
 import { pickLocale, parseAcceptLanguage } from "./oauth-i18n.js";
 import type { FetchLike } from "../client.js";
 
@@ -55,6 +56,10 @@ export interface WorkerEnv {
   WEB_CONSENT_URL?: string;
   /** The HMAC secret shared with the webmail (signs both 302 hops). A secret; absent → fail-closed. */
   MCP_WEB_LINK_SECRET?: string;
+  /** Worker-only secret that signs the stateless rid and client_id. Absent → /authorize + /register 503. */
+  MCP_STATE_SECRET?: string;
+  /** The PREVIOUS state secret during a rotation: still verifies, never signs. */
+  MCP_STATE_SECRET_PREV?: string;
   /** The webmail service binding used to redeem a handoff at /token. Absent → /token 503. */
   WEB?: WebBinding;
   /** Cloudflare's native rate limiter (wrangler.toml [[ratelimits]]), keyed per client IP on the public
@@ -117,6 +122,9 @@ function oauthDeps(env: WorkerEnv): OAuthDeps {
     ...(env.POMBUS_API_BASE !== undefined ? { coreBaseUrl: env.POMBUS_API_BASE } : {}),
     ...(env.WEB_CONSENT_URL !== undefined ? { webConsentUrl: env.WEB_CONSENT_URL } : {}),
     ...(env.MCP_WEB_LINK_SECRET !== undefined ? { webLinkSecret: env.MCP_WEB_LINK_SECRET } : {}),
+    ...(env.MCP_STATE_SECRET
+      ? { stateSecrets: [env.MCP_STATE_SECRET, ...(env.MCP_STATE_SECRET_PREV ? [env.MCP_STATE_SECRET_PREV] : [])] }
+      : {}),
     ...(web !== undefined ? { web } : {}),
   };
 }
@@ -156,7 +164,9 @@ export default {
       // /authorize, /register and /token are PUBLIC and each one writes to the shared store: without a
       // per-IP limit any client can churn it (registrations, pending requests) as fast as it can send.
       if (env.RATE_LIMIT && (path === "/authorize" || path === "/register" || path === "/token")) {
-        const ip = req.headers.get("cf-connecting-ip") ?? "noip";
+        // IPv6 by /56, IPv4 by /32 (ipBucket): a rotating address inside one /56 is still ONE caller — a fresh
+        // bucket per address let a flood of /authorize evict real users' pending logins (STORE_CAP).
+        const ip = ipBucket(req.headers.get("cf-connecting-ip"));
         if (!(await env.RATE_LIMIT.limit({ key: `${ip}:${path}` })).success) {
           return new Response(JSON.stringify({ error: "rate_limited" }), {
             status: 429, headers: { "content-type": "application/json", "retry-after": "60" },

@@ -28,7 +28,6 @@ import { DurableObject } from "cloudflare:workers";
 import {
   OAuthStore,
   type OAuthStoreLike,
-  type PendingRequest,
   type IssuedCode,
   type LiveToken,
   type OrgEntry,
@@ -39,11 +38,8 @@ import {
 export class OAuthStoreDO extends DurableObject implements OAuthStoreLike {
   private readonly store = new OAuthStore();
 
-  putRequest(id: string, r: PendingRequest): Promise<void> {
-    return this.store.putRequest(id, r);
-  }
-  takeRequest(id: string): Promise<PendingRequest | undefined> {
-    return this.store.takeRequest(id);
+  useRid(ridHash: string, expiresAt: number): Promise<boolean> {
+    return this.store.useRid(ridHash, expiresAt);
   }
   putCode(code: string, c: IssuedCode): Promise<boolean> {
     return this.store.putCode(code, c);
@@ -76,12 +72,6 @@ export class OAuthStoreDO extends DurableObject implements OAuthStoreLike {
   }
   takeLink(linkToken: string): Promise<string | undefined> {
     return this.store.takeLink(linkToken);
-  }
-  putClient(clientId: string, redirectUris: readonly string[]): Promise<boolean> {
-    return this.store.putClient(clientId, redirectUris);
-  }
-  getClient(clientId: string): Promise<readonly string[] | undefined> {
-    return this.store.getClient(clientId);
   }
   reset(): Promise<void> {
     return this.store.reset();

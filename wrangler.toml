@@ -60,6 +60,10 @@ binding = "WEB"
 service = "pombus-web"
 entrypoint = "PombusWeb"
 
-# Secret (never in this file) — `wrangler secret put MCP_WEB_LINK_SECRET`:
+# Secrets (never in this file) — set with `wrangler secret bulk <file>`, NEVER piped (runbook §6):
 #   MCP_WEB_LINK_SECRET — random 32+ bytes; HMAC-signs the two consent 302 hops. MUST byte-match the
 #                         webmail's MCP_WEB_LINK_SECRET (mail/web) or the signatures never verify.
+#   MCP_STATE_SECRET    — random 32+ bytes, WORKER-ONLY (never shared with the webmail): signs the stateless
+#                         rid and dynamic client_id. Absent → /authorize and /register answer 503.
+#   MCP_STATE_SECRET_PREV — optional, during a rotation only: the old value, still verifies, never signs.
+#                         Rotating invalidates every dynamic client_id once PREV is dropped (clients re-register).

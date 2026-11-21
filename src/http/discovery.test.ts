@@ -11,7 +11,8 @@
 //        redirect_uri outside that client's registered set is rejected (exact-match preserved).
 //   AC5  POST /register with a non-loopback http redirect (and data:/javascript:) → 400
 //        invalid_redirect_uri (the anti-open-redirect anchor).
-//   AC6  A /register flood never grows the store past the cap (oldest-eviction).
+//   AC6  /register is stateless: the client_id is SIGNED and carries its redirect_uris — a flood writes
+//        nothing; an unsigned/tampered id is invalid_client; one signed with the PREVIOUS secret still works.
 //   AC7  Root page: GET / Accept text/html no Bearer → 200 branded HTML; POST / no Bearer → 401;
 //        GET / Accept application/json no Bearer → 401 (neither becomes the page — fail-closed intact).
 //
@@ -23,7 +24,7 @@ import assert from "node:assert/strict";
 import worker, { type WorkerEnv } from "./worker.js";
 import { OAuthStore, STORE_CAP } from "./oauth.js";
 import { ROOT_TEXT } from "./oauth-i18n.js";
-import { FakeCore, type CapturedRequest, type ProgrammedReply } from "../testutil.js";
+import { spyOn, sealToken, FakeCore, type CapturedRequest, type ProgrammedReply } from "../testutil.js";
 
 const BASE = "https://core.test/v0";
 const ORIGIN = "https://mcp.test";
@@ -41,11 +42,12 @@ function core(): FakeCore {
 // R3: /authorize now delegates to the webmail, so it needs the consent URL + the HMAC secret to 302.
 const WEB_CONSENT = "https://mail.pombus.com/mcp/consent";
 const SECRET = "test_hmac_secret_shared_with_the_webmail_000";
+const STATE = "test_worker_only_state_secret_0000000000000";
 
 function env(c: FakeCore, store: OAuthStore): WorkerEnv {
   return {
     POMBUS_API_BASE: BASE, __coreFetch: c.fetch, __store: store,
-    WEB_CONSENT_URL: WEB_CONSENT, MCP_WEB_LINK_SECRET: SECRET,
+    WEB_CONSENT_URL: WEB_CONSENT, MCP_WEB_LINK_SECRET: SECRET, MCP_STATE_SECRET: STATE,
   };
 }
 
@@ -231,21 +233,76 @@ test("AC5: a missing / empty / non-array redirect_uris is invalid", async () => 
 // AC6 — the register cap: a flood never grows the store unbounded.
 // ---------------------------------------------------------------------------------------------------
 
-test("AC6: a /register flood is capped — the store evicts the oldest, never grows past STORE_CAP", async () => {
-  const store = new OAuthStore();
-  // Fill the client map to the cap directly (same shape the worker stores).
-  for (let i = 0; i < STORE_CAP; i++) {
-    const ok = await store.putClient(`flood_${i}`, ["https://x.example/cb"]);
-    assert.equal(ok, true);
+
+function authorizeWith(e: WorkerEnv, clientId: string, redirect: string): Promise<Response> {
+  const u = new URL(`${ORIGIN}/authorize`);
+  for (const [k, v] of Object.entries({ client_id: clientId, redirect_uri: redirect, response_type: "code",
+    code_challenge: "a".repeat(43), code_challenge_method: "S256", state: "st" })) u.searchParams.set(k, v);
+  return worker.fetch(new Request(u.toString(), { method: "GET" }), e);
+}
+
+test("AC6: /register writes NOTHING — a flood fills no store; each client_id is signed and self-contained", async () => {
+  const { spy: store, calls } = spyOn(new OAuthStore());
+  const e = env(core(), store);
+  for (let i = 0; i < 50; i++) assert.equal((await registerPost(e, { redirect_uris: [`https://x${i}.example/cb`] })).status, 201);
+  assert.deepEqual(calls, [], "the store is never touched by /register");
+  // a fresh Worker env (a deploy: a new, EMPTY store) still resolves a client_id registered before it
+  const reg = await json(await registerPost(e, { redirect_uris: ["https://app.one/cb"] }));
+  const after = env(core(), new OAuthStore());
+  assert.equal((await authorizeWith(after, reg["client_id"] as string, "https://app.one/cb")).status, 302);
+});
+
+test("AC6: an unsigned or tampered client_id is invalid_client; one signed with MCP_STATE_SECRET_PREV still works", async () => {
+  const e = env(core(), new OAuthStore());
+  const id = (await json(await registerPost(e, { redirect_uris: ["https://app.one/cb"] })))["client_id"] as string;
+  const [payload, sig] = id.split(".") as [string, string];
+  // re-point the redirect inside the payload, keep the old signature
+  const forgedPayload = btoa(JSON.stringify({ u: ["https://evil.example/cb"] })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  for (const bad of ["random_unsigned_client_id_0000000000000000", `${forgedPayload}.${sig}`, `${payload}.${sig.slice(0, -2)}AA`, `${payload}`]) {
+    const res = await authorizeWith(e, bad, "https://evil.example/cb");
+    assert.equal(res.status, 400, bad);
+    assert.equal(await res.text(), "invalid_client", bad);
   }
-  // The FIRST entry must still resolve (nothing evicted yet — we are exactly AT the cap).
-  assert.ok(await store.getClient("flood_0"), "at the cap, the oldest is still present");
-  // One more registration past the cap evicts the oldest (flood_0), not a refusal.
-  const ok = await store.putClient("flood_new", ["https://y.example/cb"]);
-  assert.equal(ok, true, "a registration past the cap still succeeds (window rolls)");
-  assert.equal(await store.getClient("flood_0"), undefined, "the oldest was evicted to make room");
-  assert.ok(await store.getClient("flood_new"), "the new registration is present");
-  assert.ok(await store.getClient("flood_1"), "the rest of the window is intact");
+  // rotation: the id was signed with STATE; the next deploy signs with a NEW secret and keeps STATE as PREV
+  const rotated: WorkerEnv = { ...e, MCP_STATE_SECRET: "a_brand_new_state_secret_after_rotation_000", MCP_STATE_SECRET_PREV: STATE };
+  assert.equal((await authorizeWith(rotated, id, "https://app.one/cb")).status, 302, "PREV still verifies");
+  const dropped: WorkerEnv = { ...e, MCP_STATE_SECRET: "a_brand_new_state_secret_after_rotation_000" };
+  assert.equal((await authorizeWith(dropped, id, "https://app.one/cb")).status, 400, "without PREV it is gone");
+  // ...and during the rotation the Worker SIGNS with the new secret, never with PREV: an id registered under
+  // [new, PREV] still resolves once PREV is dropped.
+  const fresh = (await json(await registerPost(rotated, { redirect_uris: ["https://app.one/cb"] })))["client_id"] as string;
+  assert.equal((await authorizeWith(dropped, fresh, "https://app.one/cb")).status, 302, "signed with the CURRENT secret");
+});
+
+test("redirect_uri is an EXACT match — near misses are refused, for a fixed AND a dynamic client", async () => {
+  const e = env(core(), new OAuthStore());
+  const dyn = (await json(await registerPost(e, { redirect_uris: ["https://app.one/cb"] })))["client_id"] as string;
+  const fixedUri = "http://127.0.0.1:6274/oauth/callback";
+  for (const [id, uri] of [["pombus-mcp", fixedUri], [dyn, "https://app.one/cb"]] as const) {
+    assert.equal((await authorizeWith(e, id, uri)).status, 302, `${id}: the exact uri`);
+    for (const near of [`${uri}x`, `${uri}/x`, `${uri}?a=b`, `${uri}.evil.com`, uri.toUpperCase()]) {
+      const res = await authorizeWith(e, id, near);
+      assert.equal(res.status, 400, `${id}: ${near}`);
+    }
+  }
+});
+
+test("a signed client_id carrying a uri /register would refuse (http non-loopback) is invalid_client", async () => {
+  const e = env(core(), new OAuthStore());
+  const forged = await sealToken(STATE, "mcp-client-v1", { u: ["http://evil.example/cb"] });
+  const res = await authorizeWith(e, forged, "http://evil.example/cb");
+  assert.equal(res.status, 400);
+  assert.equal(await res.text(), "invalid_client");
+});
+
+test("AC6: /register caps the redirect_uris (count and size) and fails closed without the state secret", async () => {
+  const e = env(core(), new OAuthStore());
+  const many = Array.from({ length: 6 }, (_, i) => `https://a${i}.example/cb`);
+  assert.equal((await registerPost(e, { redirect_uris: many })).status, 400);
+  assert.equal((await registerPost(e, { redirect_uris: [`https://x.example/${"p".repeat(600)}`] })).status, 400);
+  const noSecret: WorkerEnv = { ...e };
+  delete noSecret.MCP_STATE_SECRET;
+  assert.equal((await registerPost(noSecret, { redirect_uris: ["https://app.one/cb"] })).status, 503);
 });
 
 // ---------------------------------------------------------------------------------------------------
